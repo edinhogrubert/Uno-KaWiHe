@@ -121,6 +121,7 @@ step_3_git_sync() {
     cd "$INSTALL_DIR"
     git config --global --add safe.directory "$INSTALL_DIR" || true
     git config core.fileMode false || true
+    git remote set-url origin "$REPO_URL" || true
     git fetch origin --tags
     git checkout -- *.sh scripts/*.sh Dockerfile 2>/dev/null || true
     git pull --ff-only origin main || git pull --ff-only origin master || git reset --hard origin/main || git reset --hard origin/master
@@ -180,7 +181,7 @@ step_5_docker_build() {
   log_info "=== [ETAPA 5/6] Configuração, Build & Execução Docker ==="
 
   cd "$INSTALL_DIR"
-  chmod +x *.sh scripts/*.sh 2>/dev/null || true
+  chmod +x *.sh scripts/*.sh 2>/dev/null || sudo chmod +x *.sh scripts/*.sh 2>/dev/null || true
 
   # Garantir pasta data com permissão de escrita para o usuário node (UID 1000)
   mkdir -p "$INSTALL_DIR/data"

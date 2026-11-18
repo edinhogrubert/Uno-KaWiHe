@@ -66,12 +66,14 @@ log_info "Atualizando IP no DuckDNS..."
 
 # Atualizar IP no DuckDNS
 # O DuckDNS aceita o parâmetro ip= vazio para autodetectar o IP de origem da requisição
-DUCKDNS_SUB=$(echo "$FULL_DOMAIN" | cut -d'.' -f1)
+# Extrair o domínio raiz registrado no DuckDNS (ex: uno.grubert.duckdns.org -> grubert)
+STRIPPED_DOMAIN="${FULL_DOMAIN%.duckdns.org}"
+DUCKDNS_SUB="${STRIPPED_DOMAIN##*.}"
 UPDATE_URL="https://www.duckdns.org/update?domains=${DUCKDNS_SUB}&token=${DUCKDNS_TOKEN}&ip="
 RESPONSE=$(curl -s "$UPDATE_URL")
 
 if [[ "$RESPONSE" == "OK" ]]; then
-  log_succ "DuckDNS atualizado com sucesso para o IP atual!"
+  log_succ "DuckDNS (${DUCKDNS_SUB}.duckdns.org) atualizado com sucesso para o IP atual!"
 else
   log_warn "Resposta do DuckDNS: '$RESPONSE'. Verifique se o token e o domínio estão corretos."
 fi
@@ -83,8 +85,9 @@ log_info "Verificando/Instalando Caddy Server..."
 
 if ! command -v caddy &> /dev/null; then
   log_info "Instalando dependências para repositório oficial do Caddy..."
-  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  apt-get update -y
+  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
   apt-get update -y
   apt-get install -y caddy
@@ -96,6 +99,7 @@ fi
 # Criar configuração do Caddyfile para o domínio do usuário
 LOG_DIR="/var/log/caddy"
 mkdir -p "$LOG_DIR"
+chown -R caddy:caddy "$LOG_DIR" 2>/dev/null || true
 
 CADDYFILE_PATH="/etc/caddy/Caddyfile"
 log_info "Escrevendo configuração do Caddy em $CADDYFILE_PATH..."
@@ -104,7 +108,7 @@ cat > "$CADDYFILE_PATH" <<EOF
 ${FULL_DOMAIN} {
     # Proxy reverso para o Uno KaWiHe na porta 3000
     # Suporta HTTP, HTTPS, WebSockets (WSS) e headers de IP real automaticamente
-    reverse_proxy localhost:3000 {
+    reverse_proxy 127.0.0.1:3000 {
         header_up Host {host}
         header_up X-Real-IP {remote}
         header_up X-Forwarded-For {remote}
@@ -119,11 +123,18 @@ ${FULL_DOMAIN} {
 }
 EOF
 
-# Garantir liberação de portas 80 e 443 no firewall (UFW)
-if command -v ufw &> /dev/null && sudo ufw status | grep -q "Status: active"; then
-  sudo ufw allow 80/tcp || true
-  sudo ufw allow 443/tcp || true
+# Garantir liberação de portas 80 e 443 no firewall (UFW ou iptables Oracle Cloud)
+if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+  ufw allow 80/tcp || true
+  ufw allow 443/tcp || true
   log_succ "Portas 80 e 443 liberadas no UFW."
+elif command -v iptables &> /dev/null; then
+  for port in 80 443; do
+    if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+      iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT || true
+    fi
+  done
+  log_succ "Portas 80 e 443 liberadas no iptables."
 fi
 
 # Testar e reiniciar Caddy
