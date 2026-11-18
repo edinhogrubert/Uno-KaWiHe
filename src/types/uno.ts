@@ -505,6 +505,7 @@ export type ServerMessage =
   | { type: 'admin_rooms_list'; rooms: AdminRoomSummary[] }
   | { type: 'open_rooms_list'; rooms: OpenRoomSummary[] }
   | { type: 'player_kicked'; reason: string }
+  | { type: 'session_revoked'; reason: string }
   | { type: 'left_room_confirmed'; roomId?: string }
   | { type: 'global_announcement'; message: string; sender: string; timestamp: number }
   | {

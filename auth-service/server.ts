@@ -166,6 +166,7 @@ interface UserRecord {
   status?: UserAccountStatus;
   statusUpdatedAt?: string;
   statusReason?: string;
+  sessionVersion?: number;
   stats?: any;
 }
 
@@ -346,7 +347,12 @@ function verifyAdminRequest(req: express.Request): boolean {
     const decoded = jwt.verify(token, JWT_SECRET) as any;
     const users = getAllUsers();
     const user = users.find((u) => u.id === decoded.id);
-    return !!(user && user.role === 'admin' && isUserActive(user));
+    return !!(
+      user &&
+      user.role === 'admin' &&
+      isUserActive(user) &&
+      (decoded.sv ?? 0) === (user.sessionVersion ?? 0)
+    );
   } catch {
     return false;
   }
@@ -568,7 +574,13 @@ app.post('/api/auth/register', async (req, res) => {
     saveUsers(users);
 
     const token = jwt.sign(
-      { id: newUser.id, username: newUser.username, displayName: newUser.displayName, role: newUser.role },
+      {
+        id: newUser.id,
+        username: newUser.username,
+        displayName: newUser.displayName,
+        role: newUser.role,
+        sv: newUser.sessionVersion ?? 0,
+      },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -610,7 +622,13 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   const token = jwt.sign(
-    { id: user.id, username: user.username, displayName: user.displayName, role: user.role },
+    {
+      id: user.id,
+      username: user.username,
+      displayName: user.displayName,
+      role: user.role,
+      sv: user.sessionVersion ?? 0,
+    },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -639,6 +657,9 @@ app.get('/api/auth/me', (req, res) => {
     }
     if (!isUserActive(user)) {
       return res.status(403).json({ success: false, error: 'Conta desativada ou arquivada.' });
+    }
+    if ((decoded.sv ?? 0) !== (user.sessionVersion ?? 0)) {
+      return res.status(401).json({ success: false, error: 'Sessão encerrada ou expirada.' });
     }
 
     return res.json({
@@ -676,8 +697,8 @@ app.get('/api/user/stats', (req, res) => {
     const decoded = jwt.verify(token, JWT_SECRET) as any;
     const users = getAllUsers();
     const user = users.find((u) => u.id === decoded.id);
-    if (!user || !isUserActive(user)) {
-      return res.status(404).json({ success: false, error: 'Usuário não encontrado ou inativo.' });
+    if (!user || !isUserActive(user) || (decoded.sv ?? 0) !== (user.sessionVersion ?? 0)) {
+      return res.status(401).json({ success: false, error: 'Usuário não encontrado, inativo ou sessão encerrada.' });
     }
     return res.json({ success: true, stats: user.stats || null });
   } catch {
@@ -697,8 +718,8 @@ app.post('/api/user/stats', async (req, res) => {
     return await withDataLock(() => {
       const users = getAllUsers();
       const user = users.find((u) => u.id === decoded.id);
-      if (!user || !isUserActive(user)) {
-        return res.status(404).json({ success: false, error: 'Usuário não encontrado ou inativo.' });
+      if (!user || !isUserActive(user) || (decoded.sv ?? 0) !== (user.sessionVersion ?? 0)) {
+        return res.status(401).json({ success: false, error: 'Usuário não encontrado, inativo ou sessão encerrada.' });
       }
       user.stats = req.body.stats;
       saveUsers(users);

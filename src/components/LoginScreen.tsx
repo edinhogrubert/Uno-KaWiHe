@@ -6,9 +6,10 @@ import { KeyRound, Sparkles, User, Ticket, Shield, AlertCircle, CheckCircle2, Lo
 
 interface LoginScreenProps {
   onLoginSuccess: (user: UserProfile) => void;
+  sessionNotice?: string | null;
 }
 
-export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
+export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, sessionNotice }) => {
   const [tab, setTab] = useState<'login' | 'register'>('login');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -139,6 +140,13 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
         </div>
 
         {/* Status Messages */}
+        {!errorMsg && !successMsg && sessionNotice && (
+          <div className="mt-3 p-3 rounded-2xl bg-amber-50 border-2 border-amber-300 text-amber-900 text-xs font-bold flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+            <span>{sessionNotice}</span>
+          </div>
+        )}
+
         {errorMsg && (
           <div className="mt-3 p-3 rounded-2xl bg-rose-50 border-2 border-rose-200 text-rose-700 text-xs font-bold flex items-start gap-2 animate-in shake duration-200">
             <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />

@@ -43,6 +43,7 @@ import {
   loginUser,
   getUserFromToken,
   verifyToken,
+  isTokenSessionValid,
   verifyAdminPin,
   getAllInvites,
   saveInvites,
@@ -54,7 +55,8 @@ import {
   adminCreateUser,
   adminResetPassword,
   adminDeleteUser,
-  setUsersStatus
+  setUsersStatus,
+  bumpUserSessionVersion
 } from './server/authService.js';
 import { buildCsvTemplate } from './server/importParser.js';
 import {
@@ -1742,36 +1744,119 @@ function findUserForAdminAction(targetId: string) {
   );
 }
 
-// Admin: Disconnect Player WebSocket
-app.post('/api/admin/player-action/disconnect', (req, res) => {
+// Admin: Disconnect Player WebSocket & Revoke Active JWT Session
+app.post('/api/admin/player-action/disconnect', async (req, res) => {
   if (!isAdminRequest(req)) {
     return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
   }
-  const { targetId, reason = 'Você foi desconectado pelo Administrador.' } = req.body;
+  const { targetId, reason = 'Sua sessão foi encerrada pelo Administrador.' } = req.body;
   if (!targetId) return res.status(400).json({ success: false, error: 'ID do jogador obrigatório.' });
 
-  const matchedUser = findUserForAdminAction(String(targetId));
-  let disconnected = false;
+  const targetStr = String(targetId).trim();
+  const targetLower = targetStr.toLowerCase();
+  let matchedUser = findUserForAdminAction(targetStr);
+
+  if (matchedUser) {
+    matchedUser = (await bumpUserSessionVersion(matchedUser.id)) || matchedUser;
+  }
+
+  let closedCount = 0;
+  const closedSockets = new Set<WebSocket>();
+  const affectedRoomPlayerIds = new Set<string>();
+
+  const sendRevokeAndClose = (socket: WebSocket) => {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    let closed = false;
+    const closeNow = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+          socket.close(4001, reason);
+        }
+      } catch {}
+    };
+    try {
+      socket.send(JSON.stringify({ type: 'session_revoked', reason }), closeNow);
+      setTimeout(closeNow, 60);
+    } catch {
+      closeNow();
+    }
+  };
+
   for (const [ws, meta] of Array.from(onlinePlayers.entries())) {
-    if (matchesAdminTargetMeta(meta, String(targetId), matchedUser)) {
-      if (ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(JSON.stringify({ type: 'error', message: `⚠️ ${reason}` }));
-          ws.close(1000, reason);
-        } catch {}
-      }
+    if (matchesAdminTargetMeta(meta, targetStr, matchedUser)) {
+      sendRevokeAndClose(ws);
+      const connMeta = removeClientConnection(ws);
+      if (connMeta) affectedRoomPlayerIds.add(connMeta.playerId);
       onlinePlayers.delete(ws);
-      disconnected = true;
+      closedSockets.add(ws);
+      closedCount++;
     }
   }
 
-  if (disconnected) {
-    recordAdminAudit(req, 'PLAYER_DISCONNECT', matchedUser ? `@${matchedUser.username}` : String(targetId), reason);
+  for (const [ws, connMeta] of Array.from(clientConnections.entries())) {
+    if (closedSockets.has(ws)) continue;
+    const matchesConn =
+      connMeta.playerId === targetStr ||
+      (matchedUser && (connMeta.playerId === matchedUser.id || connMeta.playerId === `user-${matchedUser.username}`));
+    if (matchesConn) {
+      sendRevokeAndClose(ws);
+      removeClientConnection(ws);
+      affectedRoomPlayerIds.add(connMeta.playerId);
+      closedCount++;
+    }
   }
+
+  for (const room of Array.from(rooms.values())) {
+    let changed = false;
+    for (const p of [...room.players]) {
+      if (p.isBot) continue;
+      const matchesRoomSeat =
+        affectedRoomPlayerIds.has(p.id) ||
+        p.id === targetStr ||
+        p.name.toLowerCase() === targetLower ||
+        (matchedUser &&
+          (p.userId === matchedUser.id ||
+            p.id === matchedUser.id ||
+            p.id === `user-${matchedUser.username}` ||
+            p.name.toLowerCase() === matchedUser.displayName.toLowerCase() ||
+            p.name.toLowerCase() === matchedUser.username.toLowerCase()));
+      if (matchesRoomSeat) {
+        if (room.status === 'waiting' && !room.tournamentId) {
+          room.players = room.players.filter((pl) => pl.id !== p.id);
+          changed = true;
+        } else if (p.isConnected) {
+          p.isConnected = false;
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      const hasHumans = room.players.some((p) => !p.isBot && p.isConnected);
+      if (!hasHumans && !room.tournamentId) {
+        cleanupRoomResources(room);
+      } else {
+        syncRoomState(room);
+      }
+    }
+  }
+
+  if (!matchedUser && closedCount === 0) {
+    return res.status(404).json({
+      success: false,
+      error: 'Jogador não encontrado entre os clientes online ou cadastrados.',
+    });
+  }
+
+  recordAdminAudit(req, 'PLAYER_DISCONNECT', matchedUser ? `@${matchedUser.username}` : targetStr, reason);
   scheduleBroadcastOnlinePlayers();
   return res.json({
     success: true,
-    message: disconnected ? 'Jogador desconectado com sucesso.' : 'Jogador não encontrado entre os clientes online.',
+    message:
+      closedCount > 0
+        ? 'Sessão encerrada e usuário desconectado com sucesso.'
+        : 'Token de sessão revogado. O usuário precisará fazer login novamente.',
   });
 });
 
@@ -2009,6 +2094,7 @@ function disconnectUsersFromServer(userIds: string[], reason: string): number {
     if (matchesAuthId || matchesUsername || matchesPrefixedId) {
       if (ws.readyState === WebSocket.OPEN) {
         try {
+          ws.send(JSON.stringify({ type: 'session_revoked', reason }));
           ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: reason }));
           ws.close(4003, reason);
         } catch {}
@@ -4132,6 +4218,7 @@ interface OnlinePlayerSession {
   userId?: string;
   authenticatedUserId?: string;
   authenticatedRole?: string;
+  authenticatedSessionVersion?: number;
   roomId: string | null;
   connectedAt?: number;
   ip?: string;
@@ -4147,6 +4234,43 @@ interface OnlinePlayerSession {
 const onlinePlayers = new Map<WebSocket, OnlinePlayerSession>();
 const lobbyChatRateLimits = new Map<WebSocket, number[]>();
 const startSoloRateLimits = new Map<WebSocket, number>();
+
+function ensureSocketSessionActive(ws: WebSocket, messageId?: string): boolean {
+  const onlineMeta = onlinePlayers.get(ws);
+  if (!onlineMeta?.authenticatedUserId) return true;
+  const rec = getUserRecordById(onlineMeta.authenticatedUserId);
+  if (!rec || !isUserAccountActive(rec)) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        if (messageId) {
+          ws.send(JSON.stringify({ type: 'action_rejected', messageId, code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
+        }
+        ws.send(JSON.stringify({ type: 'session_revoked', reason: 'Conta desativada ou arquivada pelo administrador.' }), () => {
+          try { ws.close(4003, 'Conta desativada ou arquivada.'); } catch {}
+        });
+      } catch {}
+    }
+    onlinePlayers.delete(ws);
+    removeClientConnection(ws);
+    return false;
+  }
+  if ((onlineMeta.authenticatedSessionVersion ?? 0) !== (rec.sessionVersion ?? 0)) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        if (messageId) {
+          ws.send(JSON.stringify({ type: 'action_rejected', messageId, code: 'NOT_AUTHENTICATED', message: 'Sua sessão foi encerrada pelo Administrador.' }));
+        }
+        ws.send(JSON.stringify({ type: 'session_revoked', reason: 'Sua sessão foi encerrada pelo Administrador. Faça login novamente.' }), () => {
+          try { ws.close(4001, 'Sessão encerrada pelo Administrador.'); } catch {}
+        });
+      } catch {}
+    }
+    onlinePlayers.delete(ws);
+    removeClientConnection(ws);
+    return false;
+  }
+  return true;
+}
 
 interface RoomInvite {
   inviteId: string;
@@ -4342,13 +4466,24 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       ? authHeader.split(' ')[1]
       : urlObj?.searchParams.get('token') || undefined;
     if (handshakeToken) {
+      let handshakeSv = 0;
       const decodedHandshake = verifyToken(handshakeToken);
       if (decodedHandshake) {
+        handshakeSv = decodedHandshake.sv ?? 0;
         const rec = getUserRecordById(decodedHandshake.id);
         if (rec && !isUserAccountActive(rec)) {
           try {
-            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Esta conta foi desativada ou arquivada pelo administrador.' }));
-            ws.close(4003, 'Conta desativada ou arquivada.');
+            ws.send(JSON.stringify({ type: 'session_revoked', reason: 'Esta conta foi desativada ou arquivada pelo administrador.' }), () => {
+              try { ws.close(4003, 'Conta desativada ou arquivada.'); } catch {}
+            });
+          } catch {}
+          return;
+        }
+        if (rec && !isTokenSessionValid(decodedHandshake, rec)) {
+          try {
+            ws.send(JSON.stringify({ type: 'session_revoked', reason: 'Sua sessão foi encerrada pelo Administrador. Faça login novamente.' }), () => {
+              try { ws.close(4001, 'Sessão encerrada pelo Administrador.'); } catch {}
+            });
           } catch {}
           return;
         }
@@ -4363,6 +4498,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           userId: verified.username,
           authenticatedUserId: verified.id,
           authenticatedRole: verified.role,
+          authenticatedSessionVersion: handshakeSv,
           roomId: null,
           connectedAt,
           ip: cleanIp,
@@ -4423,14 +4559,25 @@ wss.on('connection', (ws: WebSocket, req: any) => {
 
       if (msg.type === 'register_lobby') {
         let verifiedJwtUser: ReturnType<typeof getUserFromToken> | null = null;
+        let verifiedJwtSv: number | undefined = undefined;
         if (msg.token) {
           const decodedToken = verifyToken(msg.token);
           if (decodedToken) {
+            verifiedJwtSv = decodedToken.sv ?? 0;
             const rawRec = getUserRecordById(decodedToken.id);
             if (rawRec && !isUserAccountActive(rawRec)) {
               if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
-                ws.close(4003, 'Conta desativada ou arquivada.');
+                ws.send(JSON.stringify({ type: 'session_revoked', reason: 'Conta desativada ou arquivada pelo administrador.' }), () => {
+                  try { ws.close(4003, 'Conta desativada ou arquivada.'); } catch {}
+                });
+              }
+              return;
+            }
+            if (rawRec && !isTokenSessionValid(decodedToken, rawRec)) {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'session_revoked', reason: 'Sua sessão foi encerrada pelo Administrador. Faça login novamente.' }), () => {
+                  try { ws.close(4001, 'Sessão encerrada pelo Administrador.'); } catch {}
+                });
               }
               return;
             }
@@ -4473,6 +4620,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           userId: authUser ? authUser.username : (msg.name && msg.name !== 'Visitante' ? msg.name.toLowerCase().replace(/\s+/g, '') : undefined),
           authenticatedUserId: verifiedJwtUser ? verifiedJwtUser.id : existing?.authenticatedUserId,
           authenticatedRole: verifiedJwtUser ? verifiedJwtUser.role : existing?.authenticatedRole,
+          authenticatedSessionVersion: verifiedJwtUser ? verifiedJwtSv : existing?.authenticatedSessionVersion,
           roomId: null,
           connectedAt: existing?.connectedAt || connectedAt,
           ip: cleanIp,
@@ -4663,17 +4811,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       }
 
       if (msg.type === 'start_solo') {
-        const onlineMeta = onlinePlayers.get(ws);
-        if (onlineMeta?.authenticatedUserId) {
-          const rec = getUserRecordById(onlineMeta.authenticatedUserId);
-          if (rec && !isUserAccountActive(rec)) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
-              ws.close(4003, 'Conta desativada ou arquivada.');
-            }
-            return;
-          }
-        }
+        if (!ensureSocketSessionActive(ws, msg.messageId)) return;
         const lastSolo = startSoloRateLimits.get(ws) || 0;
         if (Date.now() - lastSolo < 2000) {
           if (ws.readyState === WebSocket.OPEN) {
@@ -4863,17 +5001,8 @@ wss.on('connection', (ws: WebSocket, req: any) => {
 
       if (msg.type === 'create_room') {
         const isPrivate = !!msg.settings?.isPrivate;
+        if (!ensureSocketSessionActive(ws, msg.messageId)) return;
         const onlineMeta = onlinePlayers.get(ws);
-        if (onlineMeta?.authenticatedUserId) {
-          const rec = getUserRecordById(onlineMeta.authenticatedUserId);
-          if (rec && !isUserAccountActive(rec)) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
-              ws.close(4003, 'Conta desativada ou arquivada.');
-            }
-            return;
-          }
-        }
         if (isPrivate && (!onlineMeta || !onlineMeta.userId)) {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'error', message: 'Visitantes não podem criar salas privadas. Faça login.' }));
@@ -4941,19 +5070,10 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       }
 
       if (msg.type === 'sync_session') {
+        if (!ensureSocketSessionActive(ws, msg.messageId)) return;
         const cleanRoomId = (msg.roomId || '').replace(/[^A-Za-z0-9]/g, '').trim().toUpperCase();
         const room = rooms.get(cleanRoomId);
         const onlineMeta = onlinePlayers.get(ws);
-        if (onlineMeta?.authenticatedUserId) {
-          const rec = getUserRecordById(onlineMeta.authenticatedUserId);
-          if (rec && !isUserAccountActive(rec)) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'action_rejected', messageId: msg.messageId, code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
-              ws.close(4003, 'Conta desativada ou arquivada.');
-            }
-            return;
-          }
-        }
         if (room) {
           const player = room.players.find((p) => p.id === msg.playerId);
           if (player) {
@@ -5019,6 +5139,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       }
 
       if (msg.type === 'join_room') {
+        if (!ensureSocketSessionActive(ws, msg.messageId)) return;
         const rawRoomInput = (msg.roomId || '').trim();
         const startsWithDollar = rawRoomInput.startsWith('$');
         const startsWithStar = rawRoomInput.startsWith('*');
@@ -5029,17 +5150,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
         const cleanRoomId = rawRoomInput.replace(/[^A-Za-z0-9]/g, '').trim().toUpperCase();
         const room = rooms.get(cleanRoomId);
         const onlineMeta = onlinePlayers.get(ws);
-
-        if (onlineMeta?.authenticatedUserId) {
-          const rec = getUserRecordById(onlineMeta.authenticatedUserId);
-          if (rec && !isUserAccountActive(rec)) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'action_rejected', messageId: msg.messageId, code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
-              ws.close(4003, 'Conta desativada ou arquivada.');
-            }
-            return;
-          }
-        }
 
         if (!room) {
           ws.send(JSON.stringify({

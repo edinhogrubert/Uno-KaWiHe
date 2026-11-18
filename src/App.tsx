@@ -69,6 +69,7 @@ export default function App() {
   const [currentAvatar, setCurrentAvatar] = useState<string>(() => localStorage.getItem('uno_avatar') || '🦸‍♂️');
   const [activeEmotes, setActiveEmotes] = useState<Record<string, ActiveEmote>>({});
   const [pendingRoomPreview, setPendingRoomPreview] = useState<any | null>(null);
+  const [forcedLogoutNotice, setForcedLogoutNotice] = useState<string | null>(null);
 
   const handleJoinAsPlayerFromPreview = () => {
     if (!pendingRoomPreview || !wsRef.current || !currentUser) return;
@@ -130,9 +131,18 @@ export default function App() {
     const unsub = auth.subscribe((user) => {
       setCurrentUser(user);
       if (user) {
+        preventReconnectRef.current = false;
+        setForcedLogoutNotice(null);
         setCurrentAvatar(user.avatar);
         statsManager.initForUser(user.id, user.username);
         setIsAuthOpen(false);
+        if (
+          !wsRef.current ||
+          wsRef.current.readyState === WebSocket.CLOSED ||
+          wsRef.current.readyState === WebSocket.CLOSING
+        ) {
+          connectWebSocket();
+        }
 
         // If there is a pending room in URL when user authenticates, join it now!
         const urlParams = new URLSearchParams(window.location.search);
@@ -218,9 +228,52 @@ export default function App() {
   const myPlayerIdRef = useRef<string>(myPlayerId);
   const hasLeftRoomRef = useRef<boolean>(false);
   const isUnmountedRef = useRef<boolean>(false);
+  const preventReconnectRef = useRef<boolean>(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef<number>(0);
   const pendingQueueRef = useRef<string[]>([]);
+
+  const handleForcedSessionTermination = useCallback((reason: string) => {
+    preventReconnectRef.current = true;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    pendingQueueRef.current = [];
+    hasLeftRoomRef.current = true;
+    roomIdRef.current = null;
+    myPlayerIdRef.current = '';
+    setRoomId(null);
+    setMyPlayerId('');
+    setGameState(null);
+    setHandState(null);
+    setChatMessages([]);
+    setGameLogs([]);
+    setPendingRoomPreview(null);
+    setIsAdminRoomsOpen(false);
+    setIsAdminInvitesOpen(false);
+    setIsTournamentOpen(false);
+    setIsSettingsOpen(false);
+    setIsStatsOpen(false);
+    voiceChat.leaveVoice();
+    sessionStorage.removeItem('uno_player_id');
+    try {
+      const newUrl = new URL(window.location.href);
+      if (newUrl.searchParams.has('room')) {
+        newUrl.searchParams.delete('room');
+        window.history.replaceState({}, '', newUrl.toString());
+      }
+    } catch {}
+    setForcedLogoutNotice(reason || 'Sua sessão foi encerrada pelo Administrador.');
+    const activeSocket = wsRef.current;
+    wsRef.current = null;
+    if (activeSocket && (activeSocket.readyState === WebSocket.OPEN || activeSocket.readyState === WebSocket.CONNECTING)) {
+      try {
+        activeSocket.close(1000, 'Session terminated');
+      } catch {}
+    }
+    auth.logout();
+  }, []);
 
   useEffect(() => {
     roomIdRef.current = roomId;
@@ -235,7 +288,7 @@ export default function App() {
 
   // Setup WebSocket connection
   const connectWebSocket = useCallback(() => {
-    if (isUnmountedRef.current) return;
+    if (isUnmountedRef.current || preventReconnectRef.current) return;
     if (
       wsRef.current &&
       (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)
@@ -250,7 +303,11 @@ export default function App() {
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const socket = new WebSocket(`${protocol}//${host}/ws`);
+    const authToken = localStorage.getItem('kawihe_auth_token') || auth.getToken();
+    const wsUrl = authToken
+      ? `${protocol}//${host}/ws?token=${encodeURIComponent(authToken)}`
+      : `${protocol}//${host}/ws`;
+    const socket = new WebSocket(wsUrl);
     wsRef.current = socket;
 
     socket.onopen = () => {
@@ -458,6 +515,9 @@ export default function App() {
             msg.isSpeaking,
             msg.joined
           );
+        } else if (msg.type === 'session_revoked') {
+          handleForcedSessionTermination(msg.reason || 'Sua sessão foi encerrada pelo Administrador.');
+          return;
         } else if (msg.type === 'player_kicked') {
           setErrorMessage(`🚫 ${msg.reason || 'Você foi removido da sala.'}`);
           setRoomId(null);
@@ -515,11 +575,19 @@ export default function App() {
       }
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (wsRef.current === socket) {
         wsRef.current = null;
       }
-      if (isUnmountedRef.current) return;
+      if (event.code === 4001 || event.code === 4003) {
+        const defaultReason =
+          event.code === 4003
+            ? 'Esta conta foi desativada ou arquivada pelo administrador.'
+            : 'Sua sessão foi encerrada pelo Administrador.';
+        handleForcedSessionTermination(event.reason || defaultReason);
+        return;
+      }
+      if (isUnmountedRef.current || preventReconnectRef.current) return;
       const attempt = reconnectAttemptsRef.current;
       reconnectAttemptsRef.current = Math.min(attempt + 1, 5);
       const delayMs = Math.min(15000, 1000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 400);
@@ -536,7 +604,7 @@ export default function App() {
     socket.onerror = () => {
       // WebSocket error event objects in browsers only show { isTrusted: true } when logged directly.
     };
-  }, []);
+  }, [handleForcedSessionTermination]);
 
   useEffect(() => {
     isUnmountedRef.current = false;
@@ -555,6 +623,9 @@ export default function App() {
   }, [connectWebSocket]);
 
   const send = (msg: ClientMessage) => {
+    if (preventReconnectRef.current || !auth.getCurrentUser()) {
+      return;
+    }
     const payload = JSON.stringify({ protocolVersion: 2, ...msg });
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(payload);
@@ -796,7 +867,10 @@ export default function App() {
   if (!currentUser) {
     return (
       <LoginScreen
+        sessionNotice={forcedLogoutNotice}
         onLoginSuccess={(user) => {
+          preventReconnectRef.current = false;
+          setForcedLogoutNotice(null);
           setCurrentUser(user);
           setCurrentAvatar(user.avatar);
         }}

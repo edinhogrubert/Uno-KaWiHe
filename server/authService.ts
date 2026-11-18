@@ -23,6 +23,7 @@ export interface UserRecord {
   temporaryTournamentId?: string;
   createdByImportBatchId?: string;
   createdByImportOperationId?: string;
+  sessionVersion?: number;
 }
 
 export const MIN_USERNAME_LENGTH = 3;
@@ -376,17 +377,26 @@ export function generateToken(user: UserRecord): string {
     username: user.username,
     displayName: user.displayName,
     role: user.role,
+    sv: user.sessionVersion ?? 0,
   };
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 }
 
-export function verifyToken(token: string): { id: string; username: string; role: UserRole } | null {
+export function verifyToken(token: string): { id: string; username: string; role: UserRole; sv?: number } | null {
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as any;
     return decoded;
   } catch {
     return null;
   }
+}
+
+export function isTokenSessionValid(
+  decoded: { id: string; sv?: number } | null | undefined,
+  user: Pick<UserRecord, 'sessionVersion'> | null | undefined
+): boolean {
+  if (!decoded || !user) return false;
+  return (decoded.sv ?? 0) === (user.sessionVersion ?? 0);
 }
 
 export function toPublicProfile(user: UserRecord): UserProfile {
@@ -432,6 +442,7 @@ export function getUserFromToken(token: string): UserProfile | null {
   const user = users.find((u) => u.id === decoded.id);
   if (!user) return null;
   if (!isUserAccountActive(user)) return null;
+  if (!isTokenSessionValid(decoded, user)) return null;
   return toPublicProfile(user);
 }
 
@@ -768,6 +779,27 @@ export async function setUsersStatus(
       saveUsers(users);
     }
     return { updatedIds, skippedIds };
+  });
+}
+
+export async function bumpUserSessionVersion(targetIdOrUsername: string): Promise<UserRecord | null> {
+  const raw = (targetIdOrUsername || '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+
+  return withDataLock(() => {
+    const users = getAllUsers();
+    const user = users.find(
+      (u) =>
+        u.id === raw ||
+        u.username.toLowerCase() === lower ||
+        u.displayName.toLowerCase() === lower
+    );
+    if (!user) return null;
+
+    user.sessionVersion = (user.sessionVersion ?? 0) + 1;
+    saveUsers(users);
+    return user;
   });
 }
 
