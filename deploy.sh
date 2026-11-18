@@ -18,7 +18,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 STATE_FILE="/var/tmp/unokawihe_deploy_state"
-REPO_URL="https://github.com/wgruberts-jpg/Uno-KaWiHe.git"
+REPO_URL="https://github.com/edinhogrubert/Uno-KaWiHe.git"
 INSTALL_DIR="/opt/unokawihe"
 TARGET_USER="${SUDO_USER:-$USER}"
 
