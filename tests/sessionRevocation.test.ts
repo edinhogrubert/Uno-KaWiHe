@@ -12,6 +12,7 @@ const tempDataDir = vi.hoisted(() => {
 
 import { server } from '../server.js';
 import { generateToken, getAllUsers } from '../server/authService.js';
+import { APP_VERSION } from '../src/utils/versionHistory.js';
 
 describe('Admin Session Disconnect & JWT Revocation Integration', () => {
   let baseUrl = '';
@@ -144,5 +145,19 @@ describe('Admin Session Disconnect & JWT Revocation Integration', () => {
       headers: { Authorization: `Bearer ${willNewToken}` },
     });
     expect(meReLogin.status).toBe(200);
+  });
+
+  it('returns active version and summarized release history on GET /api/version', async () => {
+    const res = await fetch(`${baseUrl}/api/version`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.success).toBe(true);
+    expect(data.version).toBe(APP_VERSION);
+    expect(data.tag).toBe(`v${APP_VERSION}`);
+    expect(data.latestRelease?.version).toBe(APP_VERSION);
+    expect(Array.isArray(data.latestRelease?.highlights)).toBe(true);
+    expect(data.latestRelease.highlights.length).toBeGreaterThan(0);
+    expect(Array.isArray(data.history)).toBe(true);
+    expect(data.history.length).toBeGreaterThanOrEqual(3);
   });
 });

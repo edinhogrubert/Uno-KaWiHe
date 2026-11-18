@@ -7,6 +7,8 @@ import { OpenRoomsModal } from './OpenRoomsModal.js';
 import { InviteShareModal } from './InviteShareModal.js';
 import { PlayerReportModal } from './PlayerReportModal.js';
 import { HowToPlayModal } from './HowToPlayModal.js';
+import { ChangelogModal } from './ChangelogModal.js';
+import { APP_VERSION } from '../utils/versionHistory.js';
 import { auth } from '../services/auth.js';
 import {
   Users,
@@ -43,7 +45,8 @@ import {
   MessageSquare,
   RefreshCw,
   AlertTriangle,
-  Mic
+  Mic,
+  History
 } from 'lucide-react';
 
 interface LobbyProps {
@@ -177,6 +180,7 @@ export const Lobby: React.FC<LobbyProps> = ({
   const [inspectedPlayer, setInspectedPlayer] = useState<OnlinePlayerSummary | { id: string; name: string; avatar?: string; username?: string; roomId?: string | null } | null>(null);
   const [isPlayerReportOpen, setIsPlayerReportOpen] = useState(false);
   const [isStartingSolo, setIsStartingSolo] = useState(false);
+  const [isChangelogOpen, setIsChangelogOpen] = useState(false);
 
   const handleOpenPlayerReport = (p: OnlinePlayerSummary | { id: string; name: string; avatar?: string; username?: string; roomId?: string | null }) => {
     if (!isAdmin) return;
@@ -415,6 +419,15 @@ export const Lobby: React.FC<LobbyProps> = ({
               <span className="ml-1 text-amber-950 font-black text-[10px] sm:text-xs uppercase px-2.5 py-0.5 rounded-full bg-yellow-300 border-2 border-white shadow-sm">
                 Kids & Família
               </span>
+              <button
+                type="button"
+                onClick={() => setIsChangelogOpen(true)}
+                title="Ver versão atual e histórico resumido de atualizações"
+                className="ml-1 text-slate-900 font-black text-[10px] sm:text-xs px-2.5 py-0.5 rounded-full bg-white/95 hover:bg-white border-2 border-amber-400 shadow-sm cursor-pointer transition-all active:scale-95 flex items-center gap-1"
+              >
+                <History className="w-3 h-3 text-amber-600" />
+                <span>v{APP_VERSION}</span>
+              </button>
             </h1>
           </div>
 
@@ -1919,6 +1932,12 @@ export const Lobby: React.FC<LobbyProps> = ({
       isOpen={isHowToPlayModalOpen}
       onClose={() => setIsHowToPlayModalOpen(false)}
       initialTab={rulesTab}
+    />
+
+    {/* Version & Release History Modal */}
+    <ChangelogModal
+      isOpen={isChangelogOpen}
+      onClose={() => setIsChangelogOpen(false)}
     />
 
     {/* Admin Player Diagnostic Report Modal */}

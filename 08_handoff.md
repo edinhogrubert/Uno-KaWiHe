@@ -22,19 +22,17 @@ próximo passo sugerido: <1 item>
 ## Último registro
 ```
 HANDOFF
-tarefa: revisar as últimas funcionalidades (WAL import_batches.json, segurança/auth, simulador tournament-test.mjs e testes) conforme AGENTS.md e documentos normativos
+tarefa: corrigir desconexão real de sessão, melhorar Painel Central Admin, corrigir mensagens diretas, criar configdns.sh e implementar versionamento explícito (v2.3.0) com histórico resumido visível e validação no deploy
 feito:
-  - Endurecimento de segurança: removidos fallbacks ADMIN_PIN de loginUser, auth-service/server.ts e getAuthenticatedRequestUser (/api/tournaments/*); protegido GET /api/admin/cli-status com isAdminRequest; restaurado bcrypt factor 12 no bootstrap e initializedDataDir dinâmico
-  - Rate limiting composto em server.ts: 10/10min IP no cadastro, 5 falhas/5min conta + 20 falhas/5min IP no login, 20/5min IP em convites (CF-Connecting-IP + trust proxy)
-  - Consolidação da máquina de estados WAL em ImportBatchStatus (running, completed, failed, partial, reconciling), checkpoint usersSaved, proveniência em UserRecord, badges na UI e correção do acúmulo sequencial em reconcileIncompleteImportBatches
-  - Atualizado scripts/tournament-test.mjs para autenticação JWT estrita (--user/--password/--token), loop safety guard e múltiplos espectadores (preservando scripts/capacity-test.mjs intacto)
-  - Reescrito tests/tournamentStress.test.ts usando API real de tournamentEngine e expandido tests/importService.test.ts; removida pasta residual 774007
-  - Sincronizados AGENTS.md, 02-08, README.md, USE_CASES.md, SYSTEM_SPECIFICATION.md, manualSH.md, Game_funcionalidades e Game_changes.MD
-arquivos alterados: server.ts, server/authService.ts, auth-service/server.ts, server/importService.ts, src/types/uno.ts, src/components/AdminImportHistoryPanel.tsx, scripts/tournament-test.mjs, tests/tournamentStress.test.ts, tests/importService.test.ts, docs na raiz
-regras alteradas/criadas: REG-ADM-01, REG-SEG-01, REG-IMP-06 atualizadas para refletir o contrato estrito
-testes: npm test (109/109 em 9 suítes passando), tsc --noEmit e vite build verdes
-divergências encontradas: tests/tournamentStress.test.ts estava silenciosamente inativo por assinaturas antigas; /api/admin/cli-status estava aberto e loginUser/tournament routes tinham atalho de PIN; documentação citava 106/8 e valores antigos de rate limit
+  - Revogação real de sessão pelo Admin: sessionVersion em UserRecord/JWT (server/authService.ts e auth-service/server.ts), fechamento WS 4001 + evento session_revoked em server.ts e logout forçado imediato sem auto-reconexão em App.tsx/LoginScreen.tsx
+  - Versionamento v2.3.0: fonte única em src/utils/versionHistory.ts, endpoint GET /api/version, ChangelogModal.tsx com checagem de sincronização Cliente × Servidor, selos clicáveis em LoginScreen, Lobby e AdminRoomsModal (aba Sistema & Auditoria) e validação LIVE_VERSION == APP_PKG_VERSION na Etapa 6 do deploy.sh
+  - Painel Central Admin (AdminRoomsModal.tsx): abertura do PlayerReportModal por usuário, filtros, suspensão/reativação inline, limpeza de salas sem humanos e correção da leitura de /api/admin/vm-metrics
+  - Adicionados testes em tests/sessionRevocation.test.ts cobrindo revogação de sessão + /api/version
+arquivos alterados: package.json, deploy.sh, server.ts, server/authService.ts, auth-service/server.ts, src/types/uno.ts, src/App.tsx, src/utils/versionHistory.ts, src/components/ChangelogModal.tsx, src/components/LoginScreen.tsx, src/components/Lobby.tsx, src/components/AdminRoomsModal.tsx, tests/sessionRevocation.test.ts, 04_status.md, 07_historico.md, 08_handoff.md
+regras alteradas/criadas: nenhuma alteração de regra de jogo; reforçada auditoria e controle de sessão
+testes: npm test (126/126 em 12 suítes passando), tsc --noEmit, vite build e bash -n deploy.sh verdes
+divergências encontradas: AdminRoomsModal lia parsedVm.data.metrics inexistente (corrigido para parsedVm.data.metrics || parsedVm.data)
 regra AI Studio Free Tier: respeitada (100% gratuito/local, zero serviços externos pagos)
-próximo passo sugerido: executar scripts/tournament-test.mjs na VM informando --password com a senha real do administrador configurada no servidor
+próximo passo sugerido: enviar commit para edinhogrubert/Uno-KaWiHe (main) e executar deploy.sh na VM confirmando v2.3.0 na Etapa 6 e nos selos do aplicativo
 ```
 

@@ -1,6 +1,6 @@
 # 04 — Status e Planejamento
 
-Atualizado em: 2026-11-17 · Versão: v2.2.3 · **Respeitando AI Studio Free Tier (100% Gratuito)**
+Atualizado em: 2026-11-18 · Versão: v2.3.0 · **Respeitando AI Studio Free Tier (100% Gratuito)**
 
 ## Implementado
 - Servidor autoritativo com validação das jogadas (`unoEngine.ts` + `server.ts`).
@@ -18,10 +18,13 @@ Atualizado em: 2026-11-17 · Versão: v2.2.3 · **Respeitando AI Studio Free Tie
   - Máquina de estados WAL (`running`, `completed`, `failed`, `partial`, `reconciling`) com checkpoint `usersSaved`, proveniência (`createdByImportBatchId` / `createdByImportOperationId`), telemetria por operação e reconciliação automática (`reconcileIncompleteImportBatches`).
   - Ciclo de vida de contas (`active` | `disabled` | `archived`) com bloqueio em login/JWT/WS (close `4003`), preview de impacto e exclusão segura apenas sem dependências históricas.
 - **Segurança & Rate Limiting:** autenticação estrita por bcrypt/JWT em `loginUser`, `/api/tournaments/*`, `/api/admin/import/*` e `/api/admin/cli-status`, sem bypass de PIN; rate limit de falhas de login (`5`/5min conta, `20`/5min IP), cadastro (`10`/10min IP) e convites (`20`/5min IP).
-- Painel admin completo: gestão de usuários (`create`, `reset-password`, `delete`, importação em massa), convites, relatório de jogador (`/api/admin/player-report/:target`), moderação e monitor de métricas da VM (`/api/admin/vm-metrics`).
+- Painel Central Admin completo (`AdminRoomsModal.tsx`): clique direto em qualquer usuário (Salas ou Usuários) para abrir o Relatório Diagnóstico (`PlayerReportModal`), filtros rápidos (`online`, `temporários`, `inativos`, `admins`), suspensão/reativação inline, limpeza de salas sem humanos, envio direto na aba Mensagens e aba Sistema & Auditoria (métricas VM, audit log e card de versão).
+- **Desconexão Real de Sessão & Revogação JWT (`v2.3.0`):** encerramento de sessão pelo admin incrementa `sessionVersion` do usuário, invalida JWTs antigos tanto no `server.ts` quanto no `auth-service`, envia `session_revoked` + fecha WebSocket com código `4001` (sem reconexão automática no cliente) e bloqueia entrada/criação de salas para tokens revogados.
+- **Versionamento Visível & Histórico Resumido (`v2.3.0`):** `src/utils/versionHistory.ts` como fonte única, endpoint `GET /api/version`, selos clicáveis na Tela de Login, Lobby e Painel Admin abrindo `ChangelogModal` (com detecção de divergência Cliente × Servidor) e validação automática de versão na Etapa 6 do `deploy.sh`.
+- **Mensagens Diretas Admin:** entrega garantida por `authenticatedUserId` com banner global z-[90] de 15s e feedback de erro caso o usuário esteja offline.
 - Ferramenta de simulação e teste automatizado de torneios de ponta a ponta (`scripts/tournament-test.mjs` / `npm run tournament-test`) via JWT real + WebSockets, preservação de `scripts/capacity-test.mjs`, suporte a Individual e Duplas 2v2, desempates e telemetria da VM.
-- Guia de microfone para PC em HTTP/IP (Firefox/Chrome) e guia de VM.
-- Suíte de testes: **124 testes** passando em 11 arquivos (`unoEngine`: 26, `serverIntegration`: 19, `participationLogic`: 9, `tournamentEngine`: 22, `tournamentWo`: 19, `tournamentIntegration`: 5, `tournamentStress`: 2, `tournamentAdminLifecycle`: 6, `importParser`: 6, `importService`: 7, `importIntegration`: 3).
+- Guia de microfone para PC em HTTP/IP (Firefox/Chrome), guia de VM e script `configdns.sh` (DuckDNS + HTTPS via Caddy).
+- Suíte de testes: **126 testes** passando em 12 arquivos (`unoEngine`: 26, `serverIntegration`: 19, `participationLogic`: 9, `tournamentEngine`: 22, `tournamentWo`: 19, `tournamentIntegration`: 5, `tournamentStress`: 2, `tournamentAdminLifecycle`: 6, `importParser`: 6, `importService`: 7, `importIntegration`: 3, `sessionRevocation`: 2).
 
 ## Planejamento / Backlog (v2.3 — Free Tier)
 - Evolução futura do Importador: suporte a importação de equipes para torneios `doubles` (`username;displayName;password;teamName`), exportação de metadados de lote sem credenciais e senha temporária com troca obrigatória no primeiro login.

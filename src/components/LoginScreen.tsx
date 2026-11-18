@@ -2,7 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { auth } from '../services/auth.js';
 import { AVATARS_CATALOG } from '../utils/avatars.js';
 import { UserProfile } from '../types/uno.js';
-import { KeyRound, Sparkles, User, Ticket, Shield, AlertCircle, CheckCircle2, Lock } from 'lucide-react';
+import { APP_VERSION } from '../utils/versionHistory.js';
+import { ChangelogModal } from './ChangelogModal.js';
+import { KeyRound, Sparkles, User, Ticket, Shield, AlertCircle, CheckCircle2, Lock, History } from 'lucide-react';
 
 interface LoginScreenProps {
   onLoginSuccess: (user: UserProfile) => void;
@@ -21,6 +23,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, sessio
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isChangelogOpen, setIsChangelogOpen] = useState(false);
 
   useEffect(() => {
     // Check if invite code was passed in URL query param: ?invite=@XXXX
@@ -321,13 +324,27 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, sessio
         </form>
 
         {/* Info footer */}
-        <div className="mt-5 pt-3 border-t border-slate-100 text-center">
+        <div className="mt-5 pt-3 border-t border-slate-100 flex flex-col items-center gap-2 text-center">
           <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-100 text-[10px] font-bold text-slate-600">
             <Lock className="w-3 h-3 text-amber-600" />
             <span>Acesso Privado KaWiHe • Protegido por Sessão</span>
           </div>
+          <button
+            type="button"
+            onClick={() => setIsChangelogOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 hover:bg-amber-100 border border-amber-300 text-[11px] font-black text-amber-900 transition-all cursor-pointer"
+            title="Conferir versão em execução e resumo das atualizações"
+          >
+            <History className="w-3 h-3 text-amber-600" />
+            <span>Versão v{APP_VERSION} • Ver novidades</span>
+          </button>
         </div>
       </div>
+
+      <ChangelogModal
+        isOpen={isChangelogOpen}
+        onClose={() => setIsChangelogOpen(false)}
+      />
     </div>
   );
 };

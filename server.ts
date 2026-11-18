@@ -38,6 +38,7 @@ import {
   TournamentWoRemovalResult
 } from './server/unoEngine.js';
 import { EMOTES_MAP } from './src/utils/emotes.js';
+import { APP_VERSION, APP_RELEASE_DATE, RELEASE_HISTORY } from './src/utils/versionHistory.js';
 import {
   registerUser,
   loginUser,
@@ -709,6 +710,17 @@ app.get('/api/admin/cli-status', (req, res) => {
   return res.send(output);
 });
 
+app.get('/api/version', (_req, res) => {
+  return res.json({
+    success: true,
+    version: APP_VERSION,
+    tag: `v${APP_VERSION}`,
+    releaseDate: APP_RELEASE_DATE,
+    latestRelease: RELEASE_HISTORY[0] || null,
+    history: RELEASE_HISTORY,
+  });
+});
+
 // ============================================================================
 // VM RESOURCE MONITOR (CPU, RAM, Swap, Container cgroup, Network I/O, Disk)
 // ============================================================================
@@ -870,9 +882,9 @@ function readAppPackageVersion(): string {
     const pkgPath = path.join(process.cwd(), 'package.json');
     const raw = fs.readFileSync(pkgPath, 'utf8');
     const parsed = JSON.parse(raw);
-    return parsed.version || '2.2.2';
+    return parsed.version || APP_VERSION;
   } catch {
-    return '2.2.2';
+    return APP_VERSION;
   }
 }
 

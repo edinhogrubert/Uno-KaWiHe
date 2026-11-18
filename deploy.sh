@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 🚀 UNO KAWIHE - ORACLE CLOUD VM DEPLOY & CHECKPOINT ORCHESTRATOR
-# Versão: v2.2.3
+# Versão: v2.3.0
 # ==============================================================================
 # Executa o deploy em etapas com testes automáticos e suporte a retomada.
 # Se qualquer etapa falhar, o script para e mantém o ponto de parada.
@@ -9,7 +9,7 @@
 
 set -Eeuo pipefail
 
-DEPLOY_VERSION="v2.2.3"
+DEPLOY_VERSION="v2.3.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -236,10 +236,24 @@ step_6_health_check() {
 
   if [ "$HTTP_STATUS" -eq 200 ] || [ "$HTTP_STATUS" -eq 304 ] || [ "$HTTP_STATUS" -eq 404 ]; then
     PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || echo "<IP_DA_SUA_VM>")
-    APP_PKG_VERSION=$(jq -r '.version // "2.2.1"' "$INSTALL_DIR/package.json" 2>/dev/null || echo "${DEPLOY_VERSION}")
-    log_succ "🎉 DEPLOY ${DEPLOY_VERSION} (App v${APP_PKG_VERSION}) CONCLUÍDO COM SUCESSO! HTTP Status: $HTTP_STATUS"
+    APP_PKG_VERSION=$(jq -r '.version // "2.3.0"' "$INSTALL_DIR/package.json" 2>/dev/null || echo "${DEPLOY_VERSION#v}")
+    ACTIVE_COMMIT=$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo "n/a")
+    LIVE_VER_JSON=$(curl -s --max-time 4 http://localhost:3000/api/version || echo "")
+    LIVE_VERSION=$(echo "$LIVE_VER_JSON" | jq -r '.version // empty' 2>/dev/null || echo "")
+    LIVE_TITLE=$(echo "$LIVE_VER_JSON" | jq -r '.latestRelease.title // empty' 2>/dev/null || echo "")
+
+    if [ -n "$LIVE_VERSION" ] && [ "$LIVE_VERSION" != "$APP_PKG_VERSION" ]; then
+      log_err "❌ DIVERGÊNCIA DE VERSÃO APÓS DEPLOY! Código esperava v${APP_PKG_VERSION}, mas servidor respondeu v${LIVE_VERSION}."
+      log_info "Verifique se o build Docker completou corretamente e tente novamente."
+      exit 1
+    fi
+
+    log_succ "🎉 DEPLOY ${DEPLOY_VERSION} (App v${APP_PKG_VERSION} • commit ${ACTIVE_COMMIT}) CONCLUÍDO COM SUCESSO! HTTP Status: $HTTP_STATUS"
     echo "===================================================================="
-    echo "🏷️  Versão do Deploy: ${DEPLOY_VERSION} | App: v${APP_PKG_VERSION}"
+    echo "🏷️  Versão do Deploy: ${DEPLOY_VERSION} | App: v${APP_PKG_VERSION} | Commit: ${ACTIVE_COMMIT}"
+    if [ -n "$LIVE_VERSION" ]; then
+      echo "✅ Versão confirmada via /api/version: v${LIVE_VERSION}${LIVE_TITLE:+ — $LIVE_TITLE}"
+    fi
     echo "🌐 Acesse via IP: http://${PUBLIC_IP}:3000"
     echo "🔒 Para configurar seu domínio DuckDNS (ex: uno.grubert.duckdns.org) e HTTPS:"
     echo "   Execute: sudo ./configdns.sh"
