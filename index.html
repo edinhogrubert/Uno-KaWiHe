@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#1e1b4b" />
+    <title>Uno KaWiHe</title>
+    <meta name="description" content="Uno KaWiHe - Jogo de cartas multiplayer com matchmaking em tempo real, salas, chat e modo criança." />
+    <meta property="og:title" content="Uno KaWiHe" />
+    <meta property="og:description" content="Uno KaWiHe - Jogo de cartas multiplayer com matchmaking em tempo real, salas, chat e modo criança." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      // Runtime constraint: HMR is disabled in AI Studio. Ignore Vite HMR WebSocket errors.
+      window.addEventListener('unhandledrejection', function (event) {
+        var str = String(event.reason || '') + String(event.reason && event.reason.stack || '');
+        if (
+          str.indexOf('createWebSocketModuleRunnerTransport') !== -1 ||
+          str.indexOf('@vite/client') !== -1 ||
+          str.indexOf('vite-hmr') !== -1
+        ) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      });
+      window.addEventListener('error', function (event) {
+        var msg = String(event.message || '') + String(event.filename || '') + String(event.error && event.error.stack || '');
+        if (
+          msg.indexOf('createWebSocketModuleRunnerTransport') !== -1 ||
+          msg.indexOf('@vite/client') !== -1 ||
+          msg.indexOf('vite-hmr') !== -1
+        ) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          return true;
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

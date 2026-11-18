@@ -1,0 +1,59 @@
+# Docker Compose para Hospedar UNO e Microserviço Central de Autenticação KaWiHe
+services:
+  # SERVIÇO CENTRAL DE AUTENTICAÇÃO (SSO / Contas para todos os jogos)
+  kawihe-auth:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: kawihe-auth
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - JWT_SECRET=${JWT_SECRET:-kawihe_default_secure_secret_production}
+    networks:
+      - kawihe-net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.35'
+          memory: 160M
+
+  # JOGO 1: UNO Multiplayer
+  uno-game:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: uno-game
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - AUTH_SERVICE_URL=http://kawihe-auth:4000
+      - JWT_SECRET=${JWT_SECRET:-kawihe_default_secure_secret_production}
+    depends_on:
+      - kawihe-auth
+    networks:
+      - kawihe-net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 384M
+        reservations:
+          memory: 96M
+
+volumes:
+  auth-data:
+
+networks:
+  kawihe-net:
+    name: kawihe-net

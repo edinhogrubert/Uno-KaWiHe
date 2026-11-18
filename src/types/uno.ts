@@ -1,0 +1,718 @@
+export type CardColor = 'red' | 'blue' | 'green' | 'yellow' | 'wild';
+
+export type TeamId = 'A' | 'B';
+export type GameMode = 'standard' | 'team_2v2';
+export type TournamentFormat = 'single_elimination' | 'doubles_elimination';
+export type OnlinePlayersFilter = 'all' | 'lobby_only' | 'in_room';
+
+export interface OnlinePlayersPageMeta {
+  totalCount: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  filter?: OnlinePlayersFilter;
+}
+
+export type CardValue =
+  | '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
+  | 'skip' | 'reverse' | 'draw2'
+  | 'wild' | 'wild4';
+
+export interface Card {
+  id: string;
+  color: CardColor;
+  value: CardValue;
+  score: number;
+}
+
+export interface Player {
+  id: string;
+  name: string;
+  avatar: string;
+  isHost: boolean;
+  isBot: boolean;
+  cardsCount: number;
+  hasCalledUno: boolean;
+  isConnected: boolean;
+  score: number;
+  team?: TeamId;
+  teammateHand?: Card[];
+  botHand?: Card[]; // Exibido no Modo Criança (ver cartas dos robôs)
+  isSpectator?: boolean;
+}
+
+export type GameStatus = 'waiting' | 'playing' | 'paused' | 'ended';
+export type TurnDirection = 1 | -1; // 1 = clockwise, -1 = counter-clockwise
+
+export interface GameLog {
+  id: string;
+  timestamp: number;
+  text: string;
+  type: 'action' | 'uno' | 'system' | 'penalty' | 'chat';
+  playerName?: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  playerId: string;
+  playerName: string;
+  avatar: string;
+  text: string;
+  timestamp: number;
+  isSystem?: boolean;
+}
+
+export interface StagedCardPlay {
+  card: Card;
+  playerId: string;
+  playerName: string;
+  playerAvatar: string;
+  chosenColor?: CardColor;
+  timestamp: number;
+  delaySeconds: number;
+}
+
+export interface RematchVote {
+  playerId: string;
+  playerName: string;
+  ready: boolean;
+  phrase: string;
+  timestamp: number;
+}
+
+export interface HandState {
+  type: 'hand_state';
+  hand: Card[];
+  playableCardIds: string[];
+  canDraw: boolean;
+  canPassTurn: boolean;
+}
+
+export interface GameState {
+  roomId: string;
+  creatorName?: string;
+  status: GameStatus;
+  players: Player[];
+  spectators?: Array<{ id: string; name: string; avatar: string; isConnected: boolean }>;
+  myHand: Card[];
+  discardPileTop: Card | null;
+  currentColor: CardColor;
+  activeColor?: CardColor;
+  currentTurnPlayerId: string;
+
+  turnDirection: TurnDirection;
+  turnTimeLeft: number;
+  turnDuration: number;
+  drawCountPenalty: number; // accumulated if stacking or pending
+  winnerId: string | null;
+  unoVulnerablePlayerId: string | null; // player with 1 card who forgot to call UNO
+  deckCardsCount: number;
+  settings?: RoomSettings;
+  gameMode?: GameMode;
+  winnerTeam?: TeamId | null;
+  teammateId?: string | null;
+  teammateHand?: Card[];
+  isSpectator?: boolean;
+  spectatorCardsRevealed?: boolean;
+  stagedCardPlay?: StagedCardPlay | null;
+  rematchVotes?: Record<string, RematchVote>;
+  // Estatísticas da rodada e placar da mesa
+  roundDurationSeconds?: number;
+  roundTurnCount?: number;
+  roundPointsWon?: number;
+  isFastestWin?: boolean;
+  tableScores?: Record<string, TablePlayerScore>;
+  tableFastestSeconds?: number | null;
+}
+
+export interface TablePlayerScore {
+  playerId: string;
+  name: string;
+  avatar: string;
+  wins: number;
+  points: number;
+  roundsPlayed: number;
+}
+
+export interface PlayerCareerStats {
+  gamesPlayed: number;
+  gamesWon: number;
+  gamesLost: number;
+  currentStreak: number;
+  bestStreak: number;
+  totalPoints: number;
+  fastestWinSeconds: number | null; // ex: 68 segundos
+  fewestTurnsWin: number | null;     // ex: 7 turnos
+  highestRoundPoints: number;       // maior pontuação em uma única rodada
+  cardsPlayed: number;
+  plusFoursPlayed: number;
+  plusTwosPlayed: number;
+  skipsPlayed: number;
+  reversesPlayed: number;
+  colorChangesPlayed: number;
+  unoCallsSuccess: number;
+  caughtOpponentsUno: number;
+  cardsDrawnTotal: number;
+  colorDistribution: {
+    red: number;
+    blue: number;
+    green: number;
+    yellow: number;
+  };
+  achievements: string[]; // IDs das conquistas desbloqueadas
+}
+
+export interface TrophyDefinition {
+  id: string;
+  title: string;
+  description: string;
+  icon: string;
+  category: 'victory' | 'skill' | 'fun' | 'speed';
+  maxProgress: number;
+  getProgress: (stats: PlayerCareerStats) => number;
+}
+
+export type SpectatorPermission = 'disabled' | 'hidden_cards' | 'reveal_cards';
+
+export interface RoomSettings {
+  maxPlayers: number;
+  gameMode?: GameMode; // 'standard' | 'team_2v2'
+  turnDuration: number; // 0 = Sem pressa / ilimitado para crianças, ou 15, 25, 40, 60s
+  challengeUnoRule: boolean;
+  showBotCards?: boolean; // Ver cartas dos robôs (Modo Criança)
+  botSpeedMs?: number; // Tempo que os robôs demoram para largar cartas (ex: 800ms, 1800ms, 3000ms)
+  autoUnoProtection?: boolean; // Proteção infantil de UNO (grita automaticamente)
+  highlightHints?: boolean; // Destaque visual de cartas jogáveis
+  spectatorPermission?: SpectatorPermission; // 'disabled' | 'hidden_cards' | 'reveal_cards'
+  spectatorMode?: 'reveal_cards' | 'hidden_cards'; // Espectador pode ver as mãos ou apenas a mesa
+  playAnimationDelay?: number; // 0s, 1s, 2s, 3s de elevação da carta antes de ir pro centro
+  isPrivate?: boolean; // Sala privada (somente convidados)
+  tournamentId?: string; // Preparado para futuras salas vinculadas a torneios (simples ou duplas)
+  tournamentFormat?: TournamentFormat;
+}
+
+export interface RoomInvite {
+  inviteId: string;
+  roomId: string;
+  roomName: string;
+  inviterUserId: string;
+  inviterName: string;
+  inviterAvatar: string;
+  targetUserId: string;
+  status: 'pending' | 'accepted' | 'declined' | 'expired';
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface EmoteItem {
+  id: string;
+  emoji: string;
+  label: string;
+  phrase: string;
+  soundType?: string;
+}
+
+export type UserRole = 'admin' | 'player';
+export type UserAccountStatus = 'active' | 'disabled' | 'archived';
+export type UserAccountOriginType = 'permanent' | 'tournament_temporary';
+
+export interface UserProfile {
+  id: string;
+  username: string;
+  displayName: string;
+  avatar: string;
+  role: UserRole;
+  tag?: string; // Tag definitiva com # (ex: #0001, #1042)
+  createdAt: string;
+  status?: UserAccountStatus;
+  statusUpdatedAt?: string;
+  statusReason?: string;
+  accountOriginType?: UserAccountOriginType;
+  isTemporary?: boolean;
+  temporaryTournamentId?: string;
+  createdByImportBatchId?: string;
+  createdByImportOperationId?: string;
+}
+
+export interface InviteCode {
+  code: string; // Começa com @ + 4 caracteres (ex: @K9W2)
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string; // Data ISO ou "never"
+  maxUses: number;
+  usedCount: number;
+  usedBy: Array<{ username: string; usedAt: string }>;
+  status: 'active' | 'expired' | 'revoked' | 'used';
+}
+
+export interface AuthResponse {
+  success: boolean;
+  token?: string;
+  user?: UserProfile;
+  error?: string;
+  accountBlocked?: boolean;
+}
+
+export interface OnlinePlayerSummary {
+  id: string;
+  name: string;
+  avatar: string;
+  roomId: string | null;
+  userId?: string;
+  inRoom?: boolean;
+  connectedAt?: number;
+  tag?: string;
+  role?: string;
+  createdAt?: string;
+  tournamentId?: string;
+  tournamentTeamId?: string;
+}
+
+export interface PlayerReportData {
+  user: {
+    id: string;
+    username: string;
+    displayName: string;
+    avatar: string;
+    role: 'admin' | 'player' | 'visitor';
+    tag: string;
+    createdAt?: string;
+    isRegistered: boolean;
+  };
+  presence: {
+    isOnline: boolean;
+    connectedAt?: number;
+    connectedDurationSeconds?: number;
+    ip?: string;
+    userAgent?: string;
+    device?: 'mobile' | 'desktop' | 'tablet' | 'unknown';
+    browser?: string;
+    socketId?: string;
+  };
+  location: {
+    inRoom: boolean;
+    roomId: string | null;
+    roomName: string | null;
+    isPrivate: boolean;
+    gameStatus: string | null;
+    isHost: boolean;
+    isSpectator: boolean;
+    cardsCount: number;
+    score: number;
+    members: Array<{
+      id: string;
+      name: string;
+      avatar: string;
+      isHost: boolean;
+      isBot: boolean;
+      isConnected: boolean;
+      isSpectator?: boolean;
+      cardsCount: number;
+      score: number;
+    }>;
+  };
+  stats?: {
+    gamesPlayed: number;
+    gamesWon: number;
+    gamesLost: number;
+    winRate: number;
+    currentStreak: number;
+    bestStreak: number;
+    totalPoints: number;
+    unoCallsSuccess: number;
+    cardsPlayed: number;
+  };
+}
+
+export interface ActiveEmote {
+  id: string;
+  playerId: string;
+  emoteId: string;
+  emoji: string;
+  phrase: string;
+  soundType?: string;
+  timestamp: number;
+}
+
+export interface AdminRoomSummary {
+  id: string;
+  status: 'waiting' | 'playing' | 'paused' | 'ended';
+  playersCount: number;
+  maxPlayers: number;
+  turnDuration: number;
+  players: Array<{
+    id: string;
+    name: string;
+    avatar: string;
+    isHost: boolean;
+    isBot: boolean;
+    isConnected: boolean;
+    cardsCount: number;
+  }>;
+  roundTurnCount?: number;
+}
+
+export interface OpenRoomSummary {
+  id: string;
+  status: 'waiting' | 'playing' | 'paused' | 'ended';
+  playersCount: number;
+  maxPlayers: number;
+  hostName: string;
+  hostAvatar: string;
+  turnDuration: number;
+  spectatorsCount: number;
+  hasPassword?: boolean;
+  players: Array<{
+    name: string;
+    avatar: string;
+    isHost: boolean;
+    isBot: boolean;
+  }>;
+}
+
+export interface AdminUserSummary {
+  id: string;
+  username: string;
+  displayName: string;
+  avatar: string;
+  role: UserRole;
+  tag?: string;
+  createdAt: string;
+  status?: UserAccountStatus;
+  statusUpdatedAt?: string;
+  accountOriginType?: UserAccountOriginType;
+  isTemporary?: boolean;
+  temporaryTournamentId?: string;
+  isOnline: boolean;
+  currentRoomId?: string | null;
+  roomStatus?: string | null;
+}
+
+export interface VoicePeerState {
+  playerId: string;
+  isMuted: boolean;
+  isDeafened: boolean;
+  isSpeaking: boolean;
+  joined: boolean;
+}
+
+export interface Envelope {
+  protocolVersion?: number;
+  messageId?: string;
+}
+
+export type ErrorCode =
+  | 'UNSUPPORTED_VERSION'
+  | 'NOT_AUTHENTICATED'
+  | 'PLAYER_MISMATCH'
+  | 'ROOM_NOT_FOUND'
+  | 'ROOM_FULL'
+  | 'NAME_TAKEN'
+  | 'NAME_RESERVED'
+  | 'NOT_IN_ROOM'
+  | 'NOT_HOST'
+  | 'GAME_NOT_ACTIVE'
+  | 'GAME_ALREADY_STARTED'
+  | 'NOT_YOUR_TURN'
+  | 'CARD_NOT_IN_HAND'
+  | 'CARD_NOT_PLAYABLE'
+  | 'COLOR_REQUIRED'
+  | 'INVALID_CHOSEN_COLOR'
+  | 'ALREADY_DREW'
+  | 'MUST_DRAW_FIRST'
+  | 'UNO_NOT_ALLOWED'
+  | 'UNO_NOT_CATCHABLE'
+  | 'UNO_SELF_CATCH'
+  | 'RATE_LIMITED'
+  | 'INVALID_PAYLOAD'
+  | 'FORBIDDEN';
+
+// WebSocket message protocols
+export type ClientMessagePayload =
+  | { type: 'create_room'; playerName: string; avatar: string; settings?: Partial<RoomSettings> }
+  | { type: 'join_room'; roomId: string; playerName: string; avatar: string; existingPlayerId?: string; asSpectator?: boolean; spectatorRevealCards?: boolean }
+  | { type: 'sync_session'; roomId: string; playerId: string; reconnectToken?: string }
+  | { type: 'add_bot'; roomId: string; playerId?: string }
+  | { type: 'fill_bots'; roomId: string; playerId?: string }
+  | { type: 'start_solo'; playerName: string; avatar: string; botCount: number; settings?: Partial<RoomSettings> }
+  | { type: 'update_settings'; roomId: string; settings: Partial<RoomSettings>; playerId?: string }
+  | { type: 'leave_room'; roomId: string; playerId: string }
+  | { type: 'remove_bot'; roomId: string; botId: string; playerId?: string }
+  | { type: 'kick_player'; roomId: string; targetPlayerId: string; playerId?: string; reason?: string }
+  | { type: 'transfer_host'; roomId: string; targetPlayerId: string; playerId?: string }
+  | { type: 'set_team'; roomId: string; team: TeamId; targetPlayerId?: string; playerId?: string }
+  | { type: 'start_game'; roomId: string; playerId?: string }
+  | { type: 'pause_game'; roomId: string; playerId?: string }
+  | { type: 'resume_game'; roomId: string; playerId?: string }
+  | { type: 'play_card'; roomId: string; cardId: string; chosenColor?: CardColor; playerId?: string }
+  | { type: 'draw_card'; roomId: string; playerId?: string }
+  | { type: 'pass_turn'; roomId: string; playerId?: string }
+  | { type: 'call_uno'; roomId: string; playerId?: string }
+  | { type: 'catch_uno'; roomId: string; targetPlayerId: string; playerId?: string }
+  | { type: 'restart_game'; roomId: string; playerId?: string }
+  | { type: 'return_to_lobby'; roomId: string; playerId?: string }
+  | { type: 'reset_room'; roomId: string; playerId?: string }
+  | { type: 'send_chat'; roomId: string; text: string; playerId?: string }
+  | { type: 'send_emote'; roomId: string; emoteId: string; playerId?: string }
+  | { type: 'vote_rematch'; roomId: string; ready: boolean; phrase: string; playerId?: string }
+  | { type: 'toggle_spectator_reveal'; roomId: string; reveal: boolean; playerId?: string }
+  | { type: 'claim_host'; roomId: string; playerId?: string }
+  | { type: 'rtc_offer'; roomId: string; fromPlayerId: string; toPlayerId: string; offer: any }
+  | { type: 'rtc_answer'; roomId: string; fromPlayerId: string; toPlayerId: string; answer: any }
+  | { type: 'rtc_ice_candidate'; roomId: string; fromPlayerId: string; toPlayerId: string; candidate: any }
+  | { type: 'rtc_voice_state'; roomId: string; playerId: string; isMuted: boolean; isDeafened: boolean; isSpeaking: boolean; joined: boolean }
+  | { type: 'admin_get_rooms'; adminSecret?: string }
+  | { type: 'admin_close_room'; roomId: string; adminSecret?: string; reason?: string }
+  | { type: 'admin_force_end_game'; roomId: string; adminSecret?: string }
+  | { type: 'admin_global_broadcast'; message: string; sender?: string; adminSecret?: string }
+  | { type: 'get_open_rooms' }
+  | { type: 'register_lobby'; playerId: string; name: string; avatar: string; token?: string }
+  | { type: 'get_online_players_page'; page: number; pageSize?: number; filter?: OnlinePlayersFilter }
+  | { type: 'send_lobby_chat'; playerId: string; name: string; avatar: string; text: string }
+  | { type: 'send_room_invite'; roomId: string; targetUserId: string; playerId?: string }
+  | { type: 'respond_room_invite'; inviteId: string; accept: boolean; playerId?: string };
+
+export type ClientMessage = ClientMessagePayload & Envelope;
+
+export type ServerMessage =
+  | { type: 'room_joined'; roomId: string; playerId: string; reconnectToken?: string }
+  | { type: 'game_state'; state: GameState }
+  | HandState
+  | { type: 'chat_message'; message: ChatMessage }
+  | { type: 'game_log'; log: GameLog }
+  | { type: 'room_invite_received'; invite: RoomInvite }
+  | { type: 'sound_event'; sound: 'play' | 'draw' | 'uno' | 'reverse' | 'skip' | 'wild' | 'win' | 'penalty' }
+  | { type: 'player_emote'; emote: ActiveEmote }
+  | { type: 'rtc_offer'; fromPlayerId: string; toPlayerId: string; offer: any }
+  | { type: 'rtc_answer'; fromPlayerId: string; toPlayerId: string; answer: any }
+  | { type: 'rtc_ice_candidate'; fromPlayerId: string; toPlayerId: string; candidate: any }
+  | { type: 'rtc_voice_state'; roomId: string; playerId: string; isMuted: boolean; isDeafened: boolean; isSpeaking: boolean; joined: boolean }
+  | { type: 'admin_rooms_list'; rooms: AdminRoomSummary[] }
+  | { type: 'open_rooms_list'; rooms: OpenRoomSummary[] }
+  | { type: 'player_kicked'; reason: string }
+  | { type: 'left_room_confirmed'; roomId?: string }
+  | { type: 'global_announcement'; message: string; sender: string; timestamp: number }
+  | {
+      type: 'lobby_online_players';
+      players: OnlinePlayerSummary[];
+      totalCount?: number;
+      page?: number;
+      pageSize?: number;
+      totalPages?: number;
+      filter?: OnlinePlayersFilter;
+    }
+  | { type: 'lobby_chat_message'; message: { id: string; name: string; avatar: string; text: string; timestamp: number } }
+  | { type: 'lobby_invite_received'; invite: { fromName: string; fromAvatar: string; roomId: string; timestamp: number } }
+  | { type: 'action_ack'; messageId: string }
+  | { type: 'action_rejected'; messageId?: string; code: ErrorCode; message: string }
+  | { type: 'error'; message: string; code?: ErrorCode; messageId?: string };
+
+// ============================================================================
+// Importador de Usuários em Massa (Módulo Administrativo)
+// ============================================================================
+
+export type ImportOperationMode = 'create_only' | 'create_and_enroll' | 'enroll_existing';
+export type ImportSourceType = 'csv_upload' | 'text_paste';
+export type ImportDelimiter = ';' | ',' | '\t';
+export type ImportBatchStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'partial'
+  | 'reconciling'
+  | 'in_progress';
+export type ImportItemOutcome =
+  | 'created'
+  | 'enrolled'
+  | 'created_and_enrolled'
+  | 'skipped'
+  | 'rejected'
+  | 'failed';
+
+export interface ImportValidationRow {
+  lineNumber: number;
+  username: string;
+  displayName: string;
+  hasPassword: boolean;
+  status: 'valid' | 'conflict_ignorable' | 'invalid';
+  codes: string[];
+  messages: string[];
+  willCreateUser: boolean;
+  willEnrollTournament: boolean;
+  existingUserId?: string;
+  existingUserStatus?: UserAccountStatus;
+}
+
+export interface ImportValidationSummary {
+  totalLines: number;
+  validCount: number;
+  invalidCount: number;
+  duplicateUsernameInFileCount: number;
+  existingUsernameCount: number;
+  duplicateDisplayNameInFileCount: number;
+  existingDisplayNameCount: number;
+  missingRequiredFieldsCount: number;
+  invalidPasswordCount: number;
+  readyToProcessCount: number;
+  ignoredCount: number;
+  alreadyEnrolledCount: number;
+  notFoundForEnrollCount: number;
+  eligibleEnrollCount: number;
+}
+
+export interface ImportValidationResponse {
+  success: boolean;
+  error?: string;
+  ambiguousDelimiter?: boolean;
+  candidateDelimiters?: ImportDelimiter[];
+  detectedDelimiter?: ImportDelimiter;
+  mode: ImportOperationMode;
+  tournament?: {
+    id: string;
+    name: string;
+    modality: 'individual' | 'doubles';
+    status: string;
+    currentEntriesCount: number;
+    compatible: boolean;
+    incompatibilityReason?: string;
+  };
+  summary?: ImportValidationSummary;
+  rows: ImportValidationRow[];
+  previewHash?: string;
+}
+
+export interface ImportBatchItem {
+  operationId: string;
+  lineNumber: number;
+  username: string;
+  displayName?: string;
+  userId?: string;
+  userTag?: string;
+  relationType: 'created_by_batch' | 'existing_enrolled_only' | 'none';
+  userOpStatus: 'not_applicable' | 'pending' | 'persisted' | 'skipped' | 'rejected' | 'failed';
+  enrollOpStatus: 'not_applicable' | 'pending' | 'persisted' | 'skipped' | 'rejected' | 'failed';
+  outcome: ImportItemOutcome;
+  enrolledInTournament: boolean;
+  userPersistedAt?: string;
+  enrolledAt?: string;
+  reasonCode?: string;
+  reasonMessage?: string;
+}
+
+export interface ImportAuditEvent {
+  at: string;
+  actorUserId: string;
+  actorUsername: string;
+  action:
+    | 'batch_started'
+    | 'batch_completed'
+    | 'batch_reconciled'
+    | 'user_disabled'
+    | 'user_archived'
+    | 'user_reactivated'
+    | 'user_deleted';
+  targetUserIds?: string[];
+  details?: string;
+}
+
+export interface ImportBatch {
+  importBatchId: string;
+  name: string;
+  importTag: string;
+  description?: string;
+  mode: ImportOperationMode;
+  sourceType: ImportSourceType;
+  delimiterUsed: ImportDelimiter;
+  tournamentId?: string;
+  tournamentName?: string;
+  createAsTemporary?: boolean;
+  idempotencyKey: string;
+  createdAt: string;
+  createdByUserId: string;
+  createdByUsername: string;
+  status: ImportBatchStatus;
+  stepsCompleted: {
+    usersSaved: boolean;
+    tournamentSaved: boolean;
+    batchFinalized: boolean;
+  };
+  summary: {
+    totalReceived: number;
+    totalValid: number;
+    totalCreated: number;
+    totalEnrolled: number;
+    totalSkipped: number;
+    totalRejected: number;
+    totalFailed: number;
+  };
+  items: ImportBatchItem[];
+  auditTrail: ImportAuditEvent[];
+}
+
+export interface ImportBatchDetailUser {
+  lineNumber: number;
+  username: string;
+  displayName: string;
+  userId?: string;
+  userTag?: string;
+  relationType: 'created_by_batch' | 'existing_enrolled_only' | 'none';
+  outcome: ImportItemOutcome;
+  enrolledInTournament: boolean;
+  accountStatus: UserAccountStatus | 'deleted' | 'not_created';
+  createdAt?: string;
+  isCurrentlyInTournament?: boolean;
+  reasonCode?: string;
+  reasonMessage?: string;
+}
+
+export type ImportUserManageAction = 'disable' | 'archive' | 'reactivate' | 'delete';
+
+export interface ImportUserDependencyItem {
+  userId: string;
+  username: string;
+  displayName: string;
+  userTag?: string;
+  relationType: 'created_by_batch' | 'existing_enrolled_only' | 'none';
+  accountStatus: UserAccountStatus | 'deleted';
+  canManageInBatch: boolean;
+  canDelete: boolean;
+  dependencies: string[];
+  recommendedAction: 'delete_allowed' | 'disable_or_archive' | 'protected_preexisting';
+}
+
+export interface ImportImpactReport {
+  batchId: string;
+  requestedAction: ImportUserManageAction;
+  users: ImportUserDependencyItem[];
+}
+
+export interface TournamentTempUserSummary {
+  id: string;
+  username: string;
+  displayName: string;
+  tag?: string;
+  createdAt: string;
+}
+
+export interface TournamentTempUsersChallengeResponse {
+  success: boolean;
+  error?: string;
+  canExecute: boolean;
+  blockingReasons: string[];
+  tournament: {
+    id: string;
+    name: string;
+    status: string;
+  };
+  temporaryUsersCount: number;
+  temporaryUsers: TournamentTempUserSummary[];
+  permanentUsersPreservedCount: number;
+  challenge?: {
+    challengeId: string;
+    question: string;
+    expiresAt: number;
+  };
+}
+
+
+

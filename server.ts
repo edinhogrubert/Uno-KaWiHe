@@ -1,0 +1,5909 @@
+import express from 'express';
+import http from 'http';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import crypto from 'crypto';
+import { WebSocketServer, WebSocket } from 'ws';
+import {
+  Card,
+  CardColor,
+  ChatMessage,
+  ClientMessage,
+  GameLog,
+  GameState,
+  Player,
+  ServerMessage,
+  OpenRoomSummary,
+  OnlinePlayersFilter,
+  OnlinePlayerSummary
+} from './src/types/uno.js';
+import {
+  createDeck,
+  drawCardsFromDeck,
+  getNextPlayerIndex,
+  InternalPlayer,
+  isCardPlayable,
+  RoomData,
+  advanceTurnEngine,
+  handleTimeoutEngine,
+  expireUnoVulnerability,
+  assignTeams2v2,
+  calculate2v2WinScore,
+  getTeammate,
+  removeTournamentPlayerWO,
+  flushPendingTournamentWOs,
+  TournamentWoRemovalResult
+} from './server/unoEngine.js';
+import { EMOTES_MAP } from './src/utils/emotes.js';
+import {
+  registerUser,
+  loginUser,
+  getUserFromToken,
+  verifyToken,
+  verifyAdminPin,
+  getAllInvites,
+  saveInvites,
+  getAllUsers,
+  getUserRecordById,
+  getEffectiveUserStatus,
+  isUserAccountActive,
+  updateUserProfile,
+  adminCreateUser,
+  adminResetPassword,
+  adminDeleteUser
+} from './server/authService.js';
+import { buildCsvTemplate } from './server/importParser.js';
+import {
+  analyzeImportBatchUsersImpact,
+  commitImportBatch,
+  getImportBatchDetails,
+  listImportBatches,
+  manageImportBatchUsers,
+  reconcileIncompleteImportBatches,
+  validateImportBatch,
+} from './server/importService.js';
+import {
+  assertTournamentAdmin,
+  closeTournament,
+  createTournament,
+  isTournamentEnded,
+  isTournamentOpenForRegistration,
+  registerIndividualEntry,
+  registerDoublesTeam,
+  rescheduleTournament,
+  updateDoublesTeamMembers,
+  updateTournamentDetails,
+  startTournament,
+  recordGameResult,
+  advanceTournamentRound,
+  rankIndividualGroupEntries,
+  createTieBreakerGame,
+  simulateTournament,
+  Tournament,
+  TournamentConfig,
+  TournamentGroup,
+  TournamentGame,
+} from './server/tournamentEngine.js';
+import {
+  appendTournamentAuditLogStrict,
+  createTournamentTempUsersChallenge,
+  executeTournamentTempUsersCleanup,
+  loadTournamentAuditLogs,
+} from './server/tournamentCleanupService.js';
+import { withDataLock } from './server/dataLock.js';
+
+const app = express();
+app.set('trust proxy', 1);
+const server = http.createServer(app);
+const PORT = 3000;
+
+function getClientIp(req: express.Request): string {
+  const cfIp = req.headers['cf-connecting-ip'];
+  if (typeof cfIp === 'string' && cfIp.trim()) return cfIp.trim();
+  if (req.ip) return req.ip;
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) return forwarded.split(',')[0].trim();
+  return req.socket.remoteAddress || '127.0.0.1';
+}
+
+interface RateWindowEntry {
+  count: number;
+  resetAt: number;
+}
+const httpRateLimitStore = new Map<string, RateWindowEntry>();
+
+function isRateLimited(key: string, maxRequests: number, windowMs: number, consume = true): boolean {
+  const now = Date.now();
+  const entry = httpRateLimitStore.get(key);
+  if (!entry || entry.resetAt <= now) {
+    if (consume) {
+      httpRateLimitStore.set(key, { count: 1, resetAt: now + windowMs });
+    }
+    return false;
+  }
+  if (entry.count >= maxRequests) {
+    return true;
+  }
+  if (consume) {
+    entry.count += 1;
+  }
+  return false;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of httpRateLimitStore.entries()) {
+    if (v.resetAt <= now) httpRateLimitStore.delete(k);
+  }
+}, 60_000).unref();
+
+const defaultJsonMiddleware = express.json();
+const importJsonMiddleware = express.json({ limit: '1mb' });
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/admin/import')) {
+    return importJsonMiddleware(req, res, next);
+  }
+  return defaultJsonMiddleware(req, res, next);
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// Auth Microservice Proxy or Fallback Local Handler
+const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL;
+
+app.post('/api/auth/register', async (req, res) => {
+  const ip = getClientIp(req);
+  if (isRateLimited(`reg_ip:${ip}`, 10, 10 * 60 * 1000)) {
+    return res.status(429).json({ success: false, error: 'Muitas tentativas de cadastro. Aguarde alguns minutos.' });
+  }
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch (err) {
+      console.error('Failed to proxy register to auth service, falling back to local:', err);
+    }
+  }
+  const result = await registerUser(req.body);
+  return res.status(result.success ? 200 : 400).json(result);
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const ip = getClientIp(req);
+  const rawUser = String(req.body?.username || '').trim().toLowerCase();
+  if (
+    (rawUser && isRateLimited(`login_fail_acc:${rawUser}`, 5, 5 * 60 * 1000, false)) ||
+    isRateLimited(`login_fail_ip:${ip}`, 20, 5 * 60 * 1000, false)
+  ) {
+    return res.status(429).json({ success: false, error: 'Muitas tentativas de login. Aguarde alguns minutos.' });
+  }
+
+  let statusCode = 200;
+  let result: any;
+
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+        signal: AbortSignal.timeout(3500),
+      });
+      statusCode = response.status;
+      result = await response.json();
+    } catch (err) {
+      console.error('Failed to proxy login to auth service, falling back to local:', err);
+    }
+  }
+
+  if (!result) {
+    result = await loginUser(req.body);
+    statusCode = result.success ? 200 : result.accountBlocked ? 403 : 401;
+  }
+
+  if (!result.success && !result.accountBlocked) {
+    if (rawUser) isRateLimited(`login_fail_acc:${rawUser}`, 5, 5 * 60 * 1000, true);
+    isRateLimited(`login_fail_ip:${ip}`, 20, 5 * 60 * 1000, true);
+  }
+
+  return res.status(statusCode).json(result);
+});
+
+app.get('/api/auth/me', async (req, res) => {
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/auth/me`, {
+        headers: { Authorization: req.headers.authorization || '' },
+        signal: AbortSignal.timeout(3500),
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch (err) {
+      console.error('Failed to proxy /me to auth service, falling back to local:', err);
+    }
+  }
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Não autorizado.' });
+  }
+  const token = authHeader.split(' ')[1];
+  const user = getUserFromToken(token);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Sessão expirada.' });
+  }
+  return res.json({ success: true, user });
+});
+
+app.post('/api/auth/update-profile', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Não autorizado.' });
+  }
+  const token = authHeader.split(' ')[1];
+  const user = getUserFromToken(token);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Sessão expirada.' });
+  }
+  const { displayName, avatar } = req.body;
+  const updated = await updateUserProfile(user.id, displayName, avatar);
+  if (!updated) {
+    return res.status(404).json({ success: false, error: 'Usuário não encontrado.' });
+  }
+  return res.json({ success: true, user: updated });
+});
+
+app.post('/api/auth/verify-admin-pin', async (req, res) => {
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/auth/verify-admin-pin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch (err) {
+      console.error('Failed to proxy verify-admin-pin to auth service, falling back to local:', err);
+    }
+  }
+  const { pin } = req.body;
+  const isValid = verifyAdminPin(pin);
+  if (isValid) {
+    return res.json({ success: true, message: 'PIN correto!' });
+  } else {
+    return res.status(403).json({ success: false, error: 'PIN de Administrador incorreto!' });
+  }
+});
+
+// Invites API Routes
+app.get('/api/invites/validate/:code', async (req, res) => {
+  const ip = getClientIp(req);
+  if (isRateLimited(`inv_val_ip:${ip}`, 20, 5 * 60 * 1000)) {
+    return res.status(429).json({ valid: false, error: 'Muitas consultas de convite. Aguarde alguns minutos.' });
+  }
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/invites/validate/${encodeURIComponent(req.params.code)}`);
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch {
+      // fallback
+    }
+  }
+
+  let code = req.params.code?.trim().toUpperCase();
+  if (!code.startsWith('@')) code = '@' + code;
+  const invites = getAllInvites();
+  const invite = invites.find((i) => i.code.toUpperCase() === code);
+
+  if (!invite) return res.json({ valid: false, error: 'Código de convite não encontrado.' });
+  if (invite.status === 'revoked') return res.json({ valid: false, error: 'Este convite foi cancelado pelo Administrador.' });
+  if (invite.status === 'expired' || (invite.expiresAt !== 'never' && new Date(invite.expiresAt) < new Date())) {
+    return res.json({ valid: false, error: 'Este convite já expirou! Peça um novo convite ao Edinho.' });
+  }
+  if (invite.usedCount >= invite.maxUses || invite.status === 'used') {
+    return res.json({ valid: false, error: 'Este convite já foi utilizado o número máximo de vezes.' });
+  }
+
+  return res.json({ valid: true, code: invite.code, expiresAt: invite.expiresAt, remainingUses: invite.maxUses - invite.usedCount });
+});
+
+app.get('/api/invites', async (req, res) => {
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/invites`, {
+        headers: { Authorization: req.headers.authorization || '' },
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch {
+      // fallback
+    }
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Não autorizado.' });
+  }
+  const token = authHeader.split(' ')[1];
+  const user = getUserFromToken(token);
+  if (!user || user.role !== 'admin') {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const invites = getAllInvites();
+  return res.json({ success: true, invites });
+});
+
+app.post('/api/invites', async (req, res) => {
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/invites`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: req.headers.authorization || '',
+        },
+        body: JSON.stringify(req.body),
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch {
+      // fallback
+    }
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Não autorizado.' });
+  }
+  const token = authHeader.split(' ')[1];
+  const user = getUserFromToken(token);
+  if (!user || user.role !== 'admin') {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const { durationHours = 24, maxUses = 1, customCode, createdBy = 'Edinho' } = req.body;
+  let code = '';
+  if (customCode && typeof customCode === 'string') {
+    let clean = customCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (clean.startsWith('@')) clean = clean.substring(1);
+    clean = clean.substring(0, 4);
+    if (clean.length < 2) {
+      return res.status(400).json({ success: false, error: 'O código personalizado deve ter entre 2 e 4 caracteres.' });
+    }
+    code = `@${clean}`;
+  } else {
+    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    let rand = '';
+    for (let i = 0; i < 4; i++) {
+      rand += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    code = `@${rand}`;
+  }
+
+  const invites = getAllInvites();
+  if (invites.some((i) => i.code === code && i.status === 'active')) {
+    return res.status(400).json({ success: false, error: 'Este código de convite já existe e está ativo.' });
+  }
+
+  let expiresAt = 'never';
+  if (durationHours > 0) {
+    expiresAt = new Date(Date.now() + durationHours * 3600 * 1000).toISOString();
+  }
+
+  const newInvite = {
+    code,
+    createdBy,
+    createdAt: new Date().toISOString(),
+    expiresAt,
+    maxUses: Math.max(1, Number(maxUses) || 1),
+    usedCount: 0,
+    usedBy: [],
+    status: 'active' as const,
+  };
+
+  invites.unshift(newInvite);
+  saveInvites(invites);
+  return res.json({ success: true, invite: newInvite });
+});
+
+app.delete('/api/invites/:code', async (req, res) => {
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/invites/${encodeURIComponent(req.params.code)}`, {
+        method: 'DELETE',
+        headers: { Authorization: req.headers.authorization || '' },
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch {
+      // fallback
+    }
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Não autorizado.' });
+  }
+  const token = authHeader.split(' ')[1];
+  const user = getUserFromToken(token);
+  if (!user || user.role !== 'admin') {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  let code = req.params.code?.trim().toUpperCase();
+  if (!code.startsWith('@')) code = '@' + code;
+
+  const invites = getAllInvites();
+  const invite = invites.find((i) => i.code.toUpperCase() === code);
+  if (!invite) {
+    return res.status(404).json({ success: false, error: 'Convite não encontrado.' });
+  }
+
+  invite.status = 'revoked';
+  saveInvites(invites);
+  return res.json({ success: true, message: 'Convite revogado com sucesso.' });
+});
+
+// Public Open Rooms API
+app.get('/api/rooms/open', (_req, res) => {
+  const openRooms: OpenRoomSummary[] = Array.from(rooms.values())
+    .filter((r) => !r.settings?.isPrivate && r.players.some((p) => !p.isBot && p.isConnected))
+    .map((r) => {
+      const host = r.players.find((p) => p.isHost && !p.isBot) || r.players.find((p) => !p.isBot) || r.players[0];
+      return {
+        id: r.id,
+        status: r.status,
+        playersCount: r.players.length,
+        maxPlayers: r.settings.maxPlayers,
+        hostName: host ? host.name : 'Anfitrião',
+        hostAvatar: host ? host.avatar : '🎲',
+        turnDuration: r.settings.turnDuration,
+        spectatorsCount: r.spectators?.length || 0,
+        players: r.players.map((p) => ({
+          name: p.name,
+          avatar: p.avatar,
+          isHost: p.isHost,
+          isBot: p.isBot,
+        })),
+      };
+    });
+  return res.json({ success: true, rooms: openRooms });
+});
+
+app.get('/api/rooms/:id', (req, res) => {
+  const roomId = req.params.id.replace(/[^A-Za-z0-9]/g, '').trim().toUpperCase();
+  const room = rooms.get(roomId);
+  if (!room) {
+    return res.status(404).json({ success: false, error: 'Sala não encontrada.' });
+  }
+  const host = room.players.find((p) => p.isHost && !p.isBot) || room.players[0];
+  return res.json({
+    success: true,
+    room: {
+      id: room.id,
+      creatorName: room.creatorName || host?.name || 'Anfitrião',
+      status: room.status,
+      playersCount: room.players.filter(p => !p.isBot && p.isConnected).length,
+      maxPlayers: room.settings.maxPlayers,
+      settings: room.settings,
+    }
+  });
+});
+
+// User Career Stats storage with persistent disk file
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const STATS_FILE = path.join(DATA_DIR, 'stats.json');
+
+function ensureDataDir(): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+  } catch {}
+}
+
+function getAllStats(): Record<string, any> {
+  ensureDataDir();
+  try {
+    if (fs.existsSync(STATS_FILE)) {
+      return JSON.parse(fs.readFileSync(STATS_FILE, 'utf-8'));
+    }
+  } catch {}
+  return {};
+}
+
+function atomicWriteFileSync(filePath: string, data: string): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const tempPath = `${filePath}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const fd = fs.openSync(tempPath, 'w');
+  fs.writeSync(fd, data, 0, 'utf-8');
+  fs.fsyncSync(fd);
+  fs.closeSync(fd);
+  fs.renameSync(tempPath, filePath);
+}
+
+
+function saveStatsStrict(statsMap: Record<string, any>): void {
+  ensureDataDir();
+  atomicWriteFileSync(STATS_FILE, JSON.stringify(statsMap, null, 2));
+}
+
+function saveStats(statsMap: Record<string, any>): void {
+  try {
+    saveStatsStrict(statsMap);
+  } catch (e) {
+    console.error('Erro ao salvar stats.json:', e);
+  }
+}
+
+
+app.get('/api/user/stats', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Não autenticado' });
+  }
+  const token = authHeader.split(' ')[1];
+  const user = getUserFromToken(token);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Token inválido' });
+  }
+
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/user/stats`, {
+        headers: { Authorization: req.headers.authorization || '' },
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch {
+      // fallback
+    }
+  }
+
+  const statsMap = getAllStats();
+  const stats = statsMap[user.id] || statsMap[user.username.toLowerCase()] || null;
+  return res.json({ success: true, stats });
+});
+
+app.post('/api/user/stats', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Não autenticado' });
+  }
+  const token = authHeader.split(' ')[1];
+  const user = getUserFromToken(token);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Token inválido' });
+  }
+
+  const { stats } = req.body;
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/user/stats`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: req.headers.authorization || '',
+        },
+        body: JSON.stringify(req.body),
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch {
+      // fallback
+    }
+  }
+
+  const statsMap = getAllStats();
+  statsMap[user.id] = stats;
+  statsMap[user.username.toLowerCase()] = stats;
+  saveStats(statsMap);
+
+  return res.json({ success: true, message: 'Estatísticas salvas com sucesso' });
+});
+
+// Admin Room Management Helper
+function isAdminRequest(req: any): boolean {
+  const pinHeader = req.headers['x-admin-pin'];
+  if (process.env.ADMIN_PIN && pinHeader && pinHeader === process.env.ADMIN_PIN) {
+    return true;
+  }
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const user = getUserFromToken(authHeader.split(' ')[1]);
+    if (user && user.role === 'admin') return true;
+  }
+  return false;
+}
+
+// REST API for Room Administration
+app.get('/api/admin/cli-status', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+  const activeRooms = Array.from(rooms.values());
+  const allUsers = getAllUsers();
+  const humanCount = activeRooms.reduce((acc, r) => acc + r.players.filter((p) => !p.isBot && p.isConnected).length, 0);
+  const botCount = activeRooms.reduce((acc, r) => acc + r.players.filter((p) => p.isBot).length, 0);
+
+  let output = `\n======================================================\n`;
+  output += `           🎴 UNO KAWIHE - MONITOR DA VM\n`;
+  output += `======================================================\n`;
+  output += `🟢 Servidor: ONLINE (Porta 3000)\n`;
+  output += `🏠 Salas Abertas: ${activeRooms.length}\n`;
+  output += `👥 Jogadores Conectados: ${humanCount} humano(s), ${botCount} robô(s)\n`;
+  output += `📋 Usuários Cadastrados: ${allUsers.length}\n`;
+  output += `------------------------------------------------------\n`;
+
+  if (activeRooms.length === 0) {
+    output += `(Nenhuma sala ativa no momento)\n`;
+  } else {
+    activeRooms.forEach((r) => {
+      const statusStr = r.status === 'playing' ? '🎮 EM JOGO' : '⏳ LOBBY';
+      output += `\n[SALA #${r.id}] - ${statusStr} | Turno: ${r.settings.turnDuration}s | ${r.players.length}/${r.settings.maxPlayers} vagas\n`;
+      r.players.forEach((p) => {
+        const role = p.isHost ? '👑 Anfitrião' : p.isBot ? '🤖 Robô' : '🎮 Jogador';
+        const conn = p.isConnected ? '🟢 Online' : '🔴 Desconectado';
+        const cards = r.status === 'playing' ? `(${p.hand?.length || 0} cartas)` : '';
+        output += `   • ${p.avatar} ${p.name} [${role}] ${cards} - ${conn}\n`;
+      });
+    });
+  }
+
+  output += `\n------------------------------------------------------\n`;
+  output += `👤 USUÁRIOS REGISTRADOS NO SISTEMA:\n`;
+  const lobbyList = Array.from(onlinePlayers.values());
+  allUsers.forEach((u) => {
+    // Check if user is currently playing in any active room or in lobby
+    let onlineRoom: string | null = null;
+    let inLobby = false;
+
+    activeRooms.forEach((r) => {
+      const p = r.players.find((pl) => !pl.isBot && pl.isConnected && (
+        pl.id === u.id ||
+        pl.name.toLowerCase() === u.displayName.toLowerCase() ||
+        pl.name.toLowerCase() === u.username.toLowerCase()
+      ));
+      if (p) onlineRoom = r.id;
+    });
+
+    if (!onlineRoom) {
+      inLobby = lobbyList.some((lp) => 
+        lp.id === u.id ||
+        lp.name.toLowerCase() === u.displayName.toLowerCase() ||
+        lp.name.toLowerCase() === u.username.toLowerCase()
+      );
+    }
+
+    let statusBadge = `⚪ Offline`;
+    if (onlineRoom) {
+      statusBadge = `🟢 ONLINE (Na Sala #${onlineRoom})`;
+    } else if (inLobby) {
+      statusBadge = `🟢 ONLINE (No Lobby / Painel)`;
+    }
+
+    output += `   ${u.avatar} ${u.displayName} (@${u.username} ${u.tag || ''}) - [${u.role === 'admin' ? '👑 Admin' : '🎮 Jogador'}] -> ${statusBadge}\n`;
+  });
+  output += `======================================================\n\n`;
+
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  return res.send(output);
+});
+
+// ============================================================================
+// VM RESOURCE MONITOR (CPU, RAM, Swap, Container cgroup, Network I/O, Disk)
+// ============================================================================
+let prevCpuSample: { total: number; active: number; timestamp: number } | null = null;
+let prevProcCpuSample: { usage: NodeJS.CpuUsage; hrTime: bigint } | null = null;
+let prevNetSample: { rxBytes: number; txBytes: number; timestamp: number } | null = null;
+
+function readCpuTimesSample(): { total: number; active: number } {
+  try {
+    const stat = fs.readFileSync('/proc/stat', 'utf8');
+    const cpuLine = stat.split('\n').find((l) => l.startsWith('cpu '));
+    if (cpuLine) {
+      const parts = cpuLine.trim().split(/\s+/).slice(1).map((n) => Number(n) || 0);
+      const user = parts[0] || 0;
+      const nice = parts[1] || 0;
+      const system = parts[2] || 0;
+      const idle = parts[3] || 0;
+      const iowait = parts[4] || 0;
+      const irq = parts[5] || 0;
+      const softirq = parts[6] || 0;
+      const steal = parts[7] || 0;
+      const active = user + nice + system + irq + softirq + steal;
+      const total = active + idle + iowait;
+      return { total, active };
+    }
+  } catch {
+    // Fallback to os.cpus()
+  }
+  const cpus = os.cpus();
+  let total = 0;
+  let active = 0;
+  for (const cpu of cpus) {
+    const t = cpu.times;
+    const cpuActive = t.user + t.nice + t.sys + t.irq;
+    const cpuTotal = cpuActive + t.idle;
+    active += cpuActive;
+    total += cpuTotal;
+  }
+  return { total, active };
+}
+
+function readMemAndSwapInfo() {
+  const fallbackTotal = os.totalmem();
+  const fallbackFree = os.freemem();
+  let memTotalBytes = fallbackTotal;
+  let memAvailableBytes = fallbackFree;
+  let swapTotalBytes = 0;
+  let swapFreeBytes = 0;
+
+  try {
+    const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+    const map: Record<string, number> = {};
+    for (const line of meminfo.split('\n')) {
+      const match = line.match(/^([^:]+):\s+(\d+)\s*kB/i);
+      if (match) {
+        map[match[1]] = Number(match[2]) * 1024;
+      }
+    }
+    if (map.MemTotal) memTotalBytes = map.MemTotal;
+    if (typeof map.MemAvailable === 'number') {
+      memAvailableBytes = map.MemAvailable;
+    } else if (typeof map.MemFree === 'number') {
+      memAvailableBytes = map.MemFree + (map.Buffers || 0) + (map.Cached || 0);
+    }
+    swapTotalBytes = map.SwapTotal || 0;
+    swapFreeBytes = map.SwapFree || 0;
+  } catch {
+    // Keep os fallback
+  }
+
+  const memUsedBytes = Math.max(0, memTotalBytes - memAvailableBytes);
+  const swapUsedBytes = Math.max(0, swapTotalBytes - swapFreeBytes);
+
+  return {
+    totalBytes: memTotalBytes,
+    usedBytes: memUsedBytes,
+    availableBytes: memAvailableBytes,
+    usedPercent: memTotalBytes > 0 ? Number(((memUsedBytes / memTotalBytes) * 100).toFixed(1)) : 0,
+    swapTotalBytes,
+    swapUsedBytes,
+    swapFreeBytes,
+    swapPercent: swapTotalBytes > 0 ? Number(((swapUsedBytes / swapTotalBytes) * 100).toFixed(1)) : 0,
+  };
+}
+
+function readCgroupMemoryInfo(hostTotalBytes: number) {
+  let usageBytes: number | null = null;
+  let limitBytes: number | null = null;
+  try {
+    // cgroup v2
+    if (fs.existsSync('/sys/fs/cgroup/memory.current')) {
+      usageBytes = Number(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim()) || null;
+      if (fs.existsSync('/sys/fs/cgroup/memory.max')) {
+        const rawMax = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+        if (rawMax !== 'max') {
+          const parsed = Number(rawMax);
+          if (parsed > 0 && parsed <= hostTotalBytes * 2) limitBytes = parsed;
+        }
+      }
+    } else if (fs.existsSync('/sys/fs/cgroup/memory/memory.usage_in_bytes')) {
+      // cgroup v1
+      usageBytes = Number(fs.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim()) || null;
+      if (fs.existsSync('/sys/fs/cgroup/memory/memory.limit_in_bytes')) {
+        const parsed = Number(fs.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim());
+        if (parsed > 0 && parsed <= hostTotalBytes * 2) limitBytes = parsed;
+      }
+    }
+  } catch {
+    // Ignore when not running in cgroup-restricted container
+  }
+  return { usageBytes, limitBytes };
+}
+
+function readNetworkStats() {
+  let rxBytes = 0;
+  let txBytes = 0;
+  const interfaces: Array<{ name: string; rxBytes: number; txBytes: number }> = [];
+
+  try {
+    const raw = fs.readFileSync('/proc/net/dev', 'utf8');
+    const lines = raw.split('\n').slice(2);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const [ifacePart, statsPart] = trimmed.split(':');
+      if (!ifacePart || !statsPart) continue;
+      const name = ifacePart.trim();
+      if (name === 'lo') continue;
+      const cols = statsPart.trim().split(/\s+/).map((v) => Number(v) || 0);
+      const rx = cols[0] || 0;
+      const tx = cols[8] || 0;
+      rxBytes += rx;
+      txBytes += tx;
+      interfaces.push({ name, rxBytes: rx, txBytes: tx });
+    }
+  } catch {
+    // Non-Linux fallback
+  }
+
+  return { rxBytes, txBytes, interfaces };
+}
+
+function readDiskStats() {
+  try {
+    const st = fs.statfsSync(process.cwd());
+    const bsize = Number(st.bsize) || 4096;
+    const totalBytes = Number(st.blocks) * bsize;
+    const freeBytes = Number(st.bavail) * bsize;
+    const usedBytes = Math.max(0, totalBytes - freeBytes);
+    const usedPercent = totalBytes > 0 ? Number(((usedBytes / totalBytes) * 100).toFixed(1)) : 0;
+    return { totalBytes, freeBytes, usedBytes, usedPercent };
+  } catch {
+    return { totalBytes: 0, freeBytes: 0, usedBytes: 0, usedPercent: 0 };
+  }
+}
+
+function readAppPackageVersion(): string {
+  try {
+    const pkgPath = path.join(process.cwd(), 'package.json');
+    const raw = fs.readFileSync(pkgPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed.version || '2.2.2';
+  } catch {
+    return '2.2.2';
+  }
+}
+
+function measureEventLoopLagMs(): Promise<number> {
+  return new Promise((resolve) => {
+    const start = process.hrtime.bigint();
+    setImmediate(() => {
+      const diffNs = Number(process.hrtime.bigint() - start);
+      resolve(Number((diffNs / 1_000_000).toFixed(2)));
+    });
+  });
+}
+
+app.get('/api/admin/vm-metrics', async (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  try {
+    // If very first call, wait 120ms so CPU% and Net KB/s deltas are immediately accurate
+    if (!prevCpuSample || !prevNetSample) {
+      const sCpu = readCpuTimesSample();
+      const sNet = readNetworkStats();
+      prevCpuSample = { ...sCpu, timestamp: Date.now() };
+      prevNetSample = { ...sNet, timestamp: Date.now() };
+      prevProcCpuSample = { usage: process.cpuUsage(), hrTime: process.hrtime.bigint() };
+      await new Promise((r) => setTimeout(r, 120));
+    }
+
+    const now = Date.now();
+    const curCpu = readCpuTimesSample();
+    const cpuDeltaTotal = curCpu.total - prevCpuSample.total;
+    const cpuDeltaActive = curCpu.active - prevCpuSample.active;
+    const cpuPercent =
+      cpuDeltaTotal > 0 ? Number(Math.max(0, Math.min(100, (cpuDeltaActive / cpuDeltaTotal) * 100)).toFixed(1)) : 0;
+    prevCpuSample = { ...curCpu, timestamp: now };
+
+    const curHr = process.hrtime.bigint();
+    const curProcCpu = process.cpuUsage();
+    let processCpuPercent = 0;
+    if (prevProcCpuSample) {
+      const elapsedUs = Number(curHr - prevProcCpuSample.hrTime) / 1000;
+      const cpuUsedUs =
+        curProcCpu.user - prevProcCpuSample.usage.user + (curProcCpu.system - prevProcCpuSample.usage.system);
+      const cores = Math.max(1, os.cpus().length);
+      if (elapsedUs > 0) {
+        processCpuPercent = Number(
+          Math.max(0, Math.min(100, (cpuUsedUs / (elapsedUs * cores)) * 100)).toFixed(1)
+        );
+      }
+    }
+    prevProcCpuSample = { usage: curProcCpu, hrTime: curHr };
+
+    const curNet = readNetworkStats();
+    const netElapsedSec = Math.max(0.05, (now - prevNetSample.timestamp) / 1000);
+    const rxBytesPerSec = Math.max(0, Math.round((curNet.rxBytes - prevNetSample.rxBytes) / netElapsedSec));
+    const txBytesPerSec = Math.max(0, Math.round((curNet.txBytes - prevNetSample.txBytes) / netElapsedSec));
+    prevNetSample = { rxBytes: curNet.rxBytes, txBytes: curNet.txBytes, timestamp: now };
+
+    const memory = readMemAndSwapInfo();
+    const cgroup = readCgroupMemoryInfo(memory.totalBytes);
+    const nodeMem = process.memoryUsage();
+    const disk = readDiskStats();
+    const cpus = os.cpus();
+    const loadAvg = os.loadavg();
+    const eventLoopLagMs = await measureEventLoopLagMs();
+
+    const activeRooms = Array.from(rooms.values());
+    const playingRoomsCount = activeRooms.filter((r) => r.status === 'playing').length;
+    const humanPlayersOnline = activeRooms.reduce(
+      (acc, r) => acc + r.players.filter((p) => !p.isBot && p.isConnected).length,
+      0
+    );
+    const botsActive = activeRooms.reduce((acc, r) => acc + r.players.filter((p) => p.isBot).length, 0);
+    const spectatorsCount = activeRooms.reduce(
+      (acc, r) => acc + (r.spectators?.filter((s) => s.isConnected).length || 0),
+      0
+    );
+
+    let authServiceStatus: 'online' | 'offline' | 'embedded' = AUTH_SERVICE_URL ? 'offline' : 'embedded';
+    if (AUTH_SERVICE_URL) {
+      try {
+        const authRes = await fetch(`${AUTH_SERVICE_URL}/health`, {
+          signal: AbortSignal.timeout(1200),
+        });
+        if (authRes.ok) authServiceStatus = 'online';
+      } catch {
+        authServiceStatus = 'offline';
+      }
+    }
+
+    return res.json({
+      success: true,
+      timestamp: now,
+      appVersion: readAppPackageVersion(),
+      host: {
+        hostname: os.hostname(),
+        platform: `${os.type()} ${os.release()}`,
+        arch: os.arch(),
+        uptimeSeconds: Math.floor(os.uptime()),
+      },
+      cpu: {
+        usagePercent: cpuPercent,
+        processPercent: processCpuPercent,
+        cores: cpus.length || 1,
+        model: cpus[0]?.model || 'Virtual CPU',
+        loadAvg: loadAvg.map((v) => Number(v.toFixed(2))),
+      },
+      memory: {
+        ...memory,
+        containerUsageBytes: cgroup.usageBytes,
+        containerLimitBytes: cgroup.limitBytes,
+        nodeRssBytes: nodeMem.rss,
+        nodeHeapUsedBytes: nodeMem.heapUsed,
+        nodeHeapTotalBytes: nodeMem.heapTotal,
+      },
+      network: {
+        rxBytesPerSec,
+        txBytesPerSec,
+        totalRxBytes: curNet.rxBytes,
+        totalTxBytes: curNet.txBytes,
+        interfaces: curNet.interfaces,
+      },
+      disk,
+      app: {
+        processUptimeSeconds: Math.floor(process.uptime()),
+        eventLoopLagMs,
+        wsConnections: wss.clients.size,
+        lobbyOnlineCount: onlinePlayers.size,
+        activeRoomsCount: activeRooms.length,
+        playingRoomsCount,
+        humanPlayersOnline,
+        botsActive,
+        spectatorsCount,
+        authServiceStatus,
+        authServiceUrl: AUTH_SERVICE_URL || null,
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Erro ao coletar métricas da VM.' });
+  }
+});
+
+// Get all users with online & room status
+app.get('/api/admin/users', async (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  try {
+    let allUsers = getAllUsers();
+    if (AUTH_SERVICE_URL) {
+      try {
+        const response = await fetch(`${AUTH_SERVICE_URL}/api/admin/users`, {
+          headers: {
+            Authorization: req.headers.authorization || '',
+            ...(req.headers['x-admin-pin'] ? { 'x-admin-pin': req.headers['x-admin-pin'] as string } : {}),
+          },
+        });
+        const text = await response.text();
+        const data = text ? JSON.parse(text) : null;
+        if (data?.success && Array.isArray(data.users)) {
+          allUsers = data.users;
+        }
+      } catch (err) {
+        console.error('Failed to proxy /api/admin/users to auth service, falling back to local:', err);
+      }
+    }
+
+    const activeRooms = Array.from(rooms.values());
+    const lobbyList = Array.from(onlinePlayers.values());
+
+    // Check caller from JWT token
+    let callerId: string | null = null;
+    let callerUsername: string | null = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const caller = getUserFromToken(authHeader.split(' ')[1]);
+      if (caller) {
+        callerId = caller.id;
+        callerUsername = String(caller.username || '').toLowerCase();
+      }
+    }
+
+    const userList = allUsers.map((u) => {
+      let isOnline = false;
+      let currentRoomId: string | null = null;
+      let roomStatus: string | null = null;
+
+      const uUsername = String(u.username || '').toLowerCase();
+      const uDisplayName = String(u.displayName || u.username || '').toLowerCase();
+
+      // 1. Check active game rooms
+      for (const r of activeRooms) {
+        const match = r.players.find(
+          (p) => {
+            const pName = String(p.name || '').toLowerCase();
+            return (
+              !p.isBot &&
+              p.isConnected &&
+              (p.id === u.id || pName === uDisplayName || pName === uUsername)
+            );
+          }
+        );
+        if (match) {
+          isOnline = true;
+          currentRoomId = r.id;
+          roomStatus = r.status;
+          break;
+        }
+      }
+
+      // 2. Check online lobby / WebSocket players registry
+      if (!isOnline) {
+        for (const lp of lobbyList) {
+          const lpName = String(lp.name || '').toLowerCase();
+          if (lp.id === u.id || lpName === uDisplayName || lpName === uUsername) {
+            isOnline = true;
+            currentRoomId = lp.roomId || null;
+            if (lp.roomId) {
+              const r = rooms.get(lp.roomId);
+              if (r) roomStatus = r.status;
+            }
+            break;
+          }
+        }
+      }
+
+      // 3. If this user is the authenticated caller making this request right now
+      if (!isOnline && (callerId || callerUsername)) {
+        if ((callerId && u.id === callerId) || (callerUsername && uUsername === callerUsername)) {
+          isOnline = true;
+        }
+      }
+
+      const isTemp =
+        u.role !== 'admin' &&
+        u.username.toLowerCase() !== 'edinho' &&
+        u.isTemporary === true &&
+        u.accountOriginType === 'tournament_temporary' &&
+        Boolean(u.temporaryTournamentId);
+
+      return {
+        id: u.id,
+        username: u.username,
+        displayName: u.displayName || u.username,
+        avatar: u.avatar,
+        role: u.role,
+        tag: u.tag,
+        createdAt: u.createdAt,
+        status: getEffectiveUserStatus(u),
+        statusUpdatedAt: u.statusUpdatedAt,
+        accountOriginType: isTemp ? 'tournament_temporary' : 'permanent',
+        isTemporary: isTemp,
+        temporaryTournamentId: isTemp ? u.temporaryTournamentId : undefined,
+        isOnline,
+        currentRoomId,
+        roomStatus,
+      };
+    });
+
+    return res.json({ success: true, users: userList });
+  } catch (err: any) {
+    console.error('Erro em /api/admin/users:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Erro interno ao listar usuários.' });
+  }
+});
+
+// Admin: Create user directly (without invite code)
+app.post('/api/admin/users/create', async (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const body = req.body || {};
+  if (body.isTemporary === true) {
+    const tId = String(body.temporaryTournamentId || '').trim();
+    const targetTournament = tId ? tournaments.get(tId) : undefined;
+    if (!targetTournament) {
+      return res.status(400).json({ success: false, error: 'Torneio vinculado para usuário temporário não encontrado.' });
+    }
+    if (!isTournamentOpenForRegistration(targetTournament)) {
+      return res.status(400).json({
+        success: false,
+        error: `O torneio "${targetTournament.config.name}" não está aberto (status: ${targetTournament.status}).`,
+      });
+    }
+  }
+
+  if (AUTH_SERVICE_URL && body.isTemporary !== true) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/admin/users/create`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: req.headers.authorization || '',
+          ...(req.headers['x-admin-pin'] ? { 'x-admin-pin': req.headers['x-admin-pin'] as string } : {}),
+        },
+        body: JSON.stringify(req.body),
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch (err) {
+      console.error('Failed to proxy /api/admin/users/create, falling back to local:', err);
+    }
+  }
+
+  const result = await adminCreateUser({
+    ...body,
+    isTemporary: body.isTemporary === true,
+    temporaryTournamentId: body.isTemporary === true ? String(body.temporaryTournamentId || '').trim() : undefined,
+  });
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
+  return res.json(result);
+});
+
+// Admin: Reset any user password
+app.post('/api/admin/users/:id/reset-password', async (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/admin/users/${encodeURIComponent(req.params.id)}/reset-password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: req.headers.authorization || '',
+          ...(req.headers['x-admin-pin'] ? { 'x-admin-pin': req.headers['x-admin-pin'] as string } : {}),
+        },
+        body: JSON.stringify(req.body),
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch (err) {
+      console.error('Failed to proxy /api/admin/users/:id/reset-password, falling back to local:', err);
+    }
+  }
+
+  const { newPassword } = req.body;
+  const result = await adminResetPassword(req.params.id, newPassword);
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
+  return res.json(result);
+});
+
+// Admin: Delete user
+app.delete('/api/admin/users/:id', async (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  if (AUTH_SERVICE_URL) {
+    try {
+      const response = await fetch(`${AUTH_SERVICE_URL}/api/admin/users/${encodeURIComponent(req.params.id)}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: req.headers.authorization || '',
+          ...(req.headers['x-admin-pin'] ? { 'x-admin-pin': req.headers['x-admin-pin'] as string } : {}),
+        },
+      });
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    } catch (err) {
+      console.error('Failed to proxy /api/admin/users/:id delete, falling back to local:', err);
+    }
+  }
+
+  const result = await adminDeleteUser(req.params.id);
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
+  if (result.deletedUserId) {
+    disconnectUsersFromServer([result.deletedUserId], 'Esta conta foi removida pelo Administrador.');
+  }
+  return res.json(result);
+});
+
+// Send message to a specific room
+app.post('/api/admin/rooms/:id/message', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const room = rooms.get(req.params.id?.toUpperCase());
+  if (!room) {
+    return res.status(404).json({ success: false, error: 'Sala não encontrada.' });
+  }
+
+  const { text, sender = '👑 Admin Edinho' } = req.body;
+  if (!text || !text.trim()) {
+    return res.status(400).json({ success: false, error: 'Mensagem vazia.' });
+  }
+
+  const chatMsg: ChatMessage = {
+    id: `admin-msg-${Date.now()}`,
+    playerId: 'admin',
+    playerName: sender,
+    avatar: '👑',
+    text: text.trim(),
+    timestamp: Date.now(),
+  };
+
+  broadcastToRoom(room.id, { type: 'chat_message', message: chatMsg });
+  broadcastLog(room, `💬 ${sender}: ${text.trim()}`, 'chat', sender);
+
+  return res.json({ success: true, message: `Mensagem transmitida para a Sala #${room.id} com sucesso!` });
+});
+
+app.get('/api/admin/rooms', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  try {
+    const list = Array.from(rooms.values()).map((r) => ({
+      id: r.id,
+      status: r.status,
+      playersCount: r.players.length,
+      maxPlayers: r.settings.maxPlayers,
+      turnDuration: r.settings.turnDuration,
+      roundTurnCount: r.roundTurnCount || 0,
+      players: r.players.map((p) => ({
+        id: p.id,
+        name: p.name,
+        avatar: p.avatar,
+        isHost: p.isHost,
+        isBot: p.isBot,
+        isConnected: p.isConnected,
+        cardsCount: p.hand?.length || 0,
+      })),
+    }));
+
+    return res.json({ success: true, rooms: list });
+  } catch (err: any) {
+    console.error('Erro em /api/admin/rooms:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Erro interno ao listar salas.' });
+  }
+});
+
+app.post('/api/admin/rooms/:id/close', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const room = rooms.get(req.params.id?.toUpperCase());
+  if (!room) {
+    return res.status(404).json({ success: false, error: 'Sala não encontrada.' });
+  }
+
+  const reason = req.body.reason || 'Esta sala foi encerrada pelo Administrador Edinho.';
+  broadcastToRoom(room.id, { type: 'player_kicked', reason });
+  cleanupRoomResources(room);
+
+  return res.json({ success: true, message: `Sala ${room.id} fechada com sucesso.` });
+});
+
+app.post('/api/admin/rooms/:id/kick', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const room = rooms.get(req.params.id?.toUpperCase());
+  if (!room) {
+    return res.status(404).json({ success: false, error: 'Sala não encontrada.' });
+  }
+
+  const { targetPlayerId, reason = 'Você foi expulso pelo Administrador.' } = req.body;
+  const idx = room.players.findIndex((p) => p.id === targetPlayerId);
+  if (idx === -1) {
+    return res.status(404).json({ success: false, error: 'Jogador não encontrado na sala.' });
+  }
+
+  const removed = room.players.splice(idx, 1)[0];
+  // Find connection to notify
+  const targetRoomSockets = roomSockets.get(room.id);
+  if (targetRoomSockets) {
+    for (const ws of Array.from(targetRoomSockets)) {
+      const meta = clientConnections.get(ws);
+      if (meta && meta.playerId === targetPlayerId) {
+        safeWsSend(ws, JSON.stringify({ type: 'player_kicked', reason }));
+        removeClientConnection(ws);
+      }
+    }
+  }
+
+  broadcastLog(room, `🚫 ${removed.name} foi expulso da sala pelo Administrador.`, 'system');
+  syncRoomState(room);
+
+  return res.json({ success: true, message: `${removed.name} foi expulso com sucesso.` });
+});
+
+app.post('/api/admin/broadcast', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const { message, sender = '👑 Admin Edinho' } = req.body;
+  if (!message || !message.trim()) {
+    return res.status(400).json({ success: false, error: 'Mensagem não pode estar vazia.' });
+  }
+
+  const announcement: ServerMessage = {
+    type: 'global_announcement',
+    message: message.trim(),
+    sender,
+    timestamp: Date.now(),
+  };
+
+  rooms.forEach((room) => {
+    broadcastToRoom(room.id, announcement);
+    broadcastLog(room, `📢 [AVISO GLOBAL]: ${message.trim()}`, 'system', sender);
+  });
+
+  return res.json({ success: true, message: 'Aviso global transmitido a todas as salas com sucesso.' });
+});
+
+// Helper to parse user agent for admin diagnostic
+function parseUserAgentInfo(ua: string): { device: 'mobile' | 'desktop' | 'tablet' | 'unknown'; browser: string } {
+  if (!ua) return { device: 'unknown', browser: 'Desconhecido' };
+  const isMobile = /mobile|iphone|ipod|android.*mobile|blackberry|iemobile/i.test(ua);
+  const isTablet = /tablet|ipad|android(?!.*mobile)/i.test(ua);
+  const device: 'mobile' | 'desktop' | 'tablet' | 'unknown' = isTablet ? 'tablet' : isMobile ? 'mobile' : 'desktop';
+
+  let browser = 'Navegador Web';
+  if (/chrome|crios/i.test(ua) && !/edg|opr/i.test(ua)) browser = isMobile ? 'Chrome Mobile' : 'Google Chrome';
+  else if (/safari/i.test(ua) && !/chrome|crios/i.test(ua)) browser = isMobile ? 'Mobile Safari' : 'Apple Safari';
+  else if (/firefox|fxios/i.test(ua)) browser = isMobile ? 'Firefox Mobile' : 'Mozilla Firefox';
+  else if (/edg/i.test(ua)) browser = 'Microsoft Edge';
+  else if (/opr|opera/i.test(ua)) browser = 'Opera';
+
+  return { device, browser };
+}
+
+// Admin: Get Comprehensive Player Report
+app.get('/api/admin/player-report/:target', async (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const target = (req.params.target || '').trim();
+  const targetLower = target.toLowerCase();
+
+  // 1. Find user in persistent users store
+  const allUsers = getAllUsers();
+  const matchedUser = allUsers.find(
+    (u) =>
+      u.id === target ||
+      u.username.toLowerCase() === targetLower ||
+      u.displayName.toLowerCase() === targetLower
+  );
+
+  // 2. Find online session in onlinePlayers map
+  let matchedMeta: any = null;
+  let targetWs: WebSocket | null = null;
+  for (const [ws, meta] of onlinePlayers.entries()) {
+    if (
+      meta.id === target ||
+      (meta.userId && meta.userId.toLowerCase() === targetLower) ||
+      meta.name.toLowerCase() === targetLower ||
+      (matchedUser && meta.name.toLowerCase() === matchedUser.displayName.toLowerCase())
+    ) {
+      matchedMeta = meta;
+      targetWs = ws;
+      break;
+    }
+  }
+
+  // 3. Find if player is currently in any room
+  let currentRoom: RoomData | null = null;
+  let playerInRoom: InternalPlayer | null = null;
+  let isSpectator = false;
+
+  const targetRoomId = matchedMeta?.roomId;
+  if (targetRoomId) {
+    currentRoom = rooms.get(targetRoomId.toUpperCase()) || null;
+  }
+
+  if (!currentRoom) {
+    for (const r of rooms.values()) {
+      const p = r.players.find(
+        (pl) =>
+          pl.id === target ||
+          pl.name.toLowerCase() === targetLower ||
+          (matchedUser && pl.name.toLowerCase() === matchedUser.displayName.toLowerCase())
+      );
+      if (p) {
+        currentRoom = r;
+        playerInRoom = p;
+        break;
+      }
+      const s = (r.spectators || []).find(
+        (sp) =>
+          sp.id === target ||
+          sp.name.toLowerCase() === targetLower ||
+          (matchedUser && sp.name.toLowerCase() === matchedUser.displayName.toLowerCase())
+      );
+      if (s) {
+        currentRoom = r;
+        isSpectator = true;
+        break;
+      }
+    }
+  } else {
+    playerInRoom =
+      currentRoom.players.find(
+        (pl) =>
+          pl.id === target ||
+          pl.name.toLowerCase() === targetLower ||
+          (matchedUser && pl.name.toLowerCase() === matchedUser.displayName.toLowerCase())
+      ) || null;
+    if (!playerInRoom && (currentRoom.spectators || []).some((s) => s.id === target || s.name.toLowerCase() === targetLower)) {
+      isSpectator = true;
+    }
+  }
+
+  // 4. Retrieve Career Stats
+  const allStats = getAllStats();
+  const userStats = matchedUser
+    ? allStats[matchedUser.id] || allStats[matchedUser.username.toLowerCase()] || null
+    : null;
+  const gamesPlayed = userStats?.gamesPlayed || 0;
+  const gamesWon = userStats?.gamesWon || 0;
+  const gamesLost = userStats?.gamesLost || 0;
+  const winRate = gamesPlayed > 0 ? Math.round((gamesWon / gamesPlayed) * 100) : 0;
+
+  // 5. Connection timing & User Agent
+  const connectedAt = matchedMeta?.connectedAt || (matchedUser ? Date.now() - 60000 : undefined);
+  const now = Date.now();
+  const connectedDurationSeconds = connectedAt ? Math.max(0, Math.floor((now - connectedAt) / 1000)) : 0;
+  const uaInfo = parseUserAgentInfo(matchedMeta?.userAgent || '');
+
+  const report = {
+    user: {
+      id: matchedUser?.id || matchedMeta?.id || target,
+      username: matchedUser?.username || matchedMeta?.userId || (matchedMeta ? matchedMeta.name.toLowerCase().replace(/\s+/g, '') : target),
+      displayName: matchedUser?.displayName || matchedMeta?.name || target,
+      avatar: matchedUser?.avatar || matchedMeta?.avatar || '👤',
+      role: matchedUser?.role || (matchedMeta?.role === 'admin' ? 'admin' : matchedMeta ? 'player' : 'visitor'),
+      tag: matchedUser?.tag || matchedMeta?.tag || '#0000',
+      createdAt: matchedUser?.createdAt,
+      isRegistered: !!matchedUser,
+    },
+    presence: {
+      isOnline: !!matchedMeta && (!targetWs || targetWs.readyState === WebSocket.OPEN),
+      connectedAt,
+      connectedDurationSeconds,
+      ip: matchedMeta?.ip || '127.0.0.1',
+      userAgent: matchedMeta?.userAgent || 'Desconhecido',
+      device: uaInfo.device,
+      browser: uaInfo.browser,
+      socketId: matchedMeta?.socketId || 'N/A',
+    },
+    location: {
+      inRoom: !!currentRoom,
+      roomId: currentRoom ? currentRoom.id : null,
+      roomName: currentRoom ? `Mesa #${currentRoom.id}${currentRoom.settings.isPrivate ? ' (Privada)' : ' (Pública)'}` : null,
+      isPrivate: currentRoom ? !!currentRoom.settings.isPrivate : false,
+      gameStatus: currentRoom ? currentRoom.status : null,
+      isHost: playerInRoom ? !!playerInRoom.isHost : false,
+      isSpectator,
+      cardsCount: playerInRoom ? playerInRoom.cardsCount : 0,
+      score: playerInRoom ? playerInRoom.score : 0,
+      members: currentRoom
+        ? currentRoom.players.map((p) => ({
+            id: p.id,
+            name: p.name,
+            avatar: p.avatar,
+            isHost: !!p.isHost,
+            isBot: !!p.isBot,
+            isConnected: !!p.isConnected,
+            cardsCount: p.cardsCount,
+            score: p.score,
+          }))
+        : [],
+    },
+    stats: {
+      gamesPlayed,
+      gamesWon,
+      gamesLost,
+      winRate,
+      currentStreak: userStats?.currentStreak || 0,
+      bestStreak: userStats?.bestStreak || 0,
+      totalPoints: userStats?.totalPoints || 0,
+      unoCallsSuccess: userStats?.unoCallsSuccess || 0,
+      cardsPlayed: userStats?.cardsPlayed || 0,
+    },
+  };
+
+  return res.json({ success: true, report });
+});
+
+// Admin: Disconnect Player WebSocket
+app.post('/api/admin/player-action/disconnect', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+  const { targetId, reason = 'Você foi desconectado pelo Administrador.' } = req.body;
+  if (!targetId) return res.status(400).json({ success: false, error: 'ID do jogador obrigatório.' });
+
+  let disconnected = false;
+  for (const [ws, meta] of onlinePlayers.entries()) {
+    if (meta.id === targetId || meta.userId === targetId || meta.name === targetId) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: 'error', message: `⚠️ ${reason}` }));
+          ws.close(1000, reason);
+        } catch {}
+      }
+      onlinePlayers.delete(ws);
+      disconnected = true;
+      break;
+    }
+  }
+
+  scheduleBroadcastOnlinePlayers();
+  return res.json({
+    success: true,
+    message: disconnected ? 'Jogador desconectado com sucesso.' : 'Jogador não encontrado entre os clientes online.',
+  });
+});
+
+// Admin: Kick Player from Room
+app.post('/api/admin/player-action/kick-room', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+  const { targetId, roomId, reason = 'Você foi retirado da sala pelo Administrador.' } = req.body;
+  let targetRoom: RoomData | undefined;
+  if (roomId) {
+    targetRoom = rooms.get(roomId.toUpperCase());
+  } else {
+    for (const r of rooms.values()) {
+      if (r.players.some((p) => p.id === targetId || p.name === targetId)) {
+        targetRoom = r;
+        break;
+      }
+    }
+  }
+
+  if (!targetRoom) {
+    return res.status(404).json({ success: false, error: 'Sala ou jogador não encontrado.' });
+  }
+
+  const pIdx = targetRoom.players.findIndex((p) => p.id === targetId || p.name === targetId);
+  if (pIdx === -1) {
+    return res.status(404).json({ success: false, error: 'Jogador não está nesta sala.' });
+  }
+
+  const removed = targetRoom.players.splice(pIdx, 1)[0];
+  const targetSockets = roomSockets.get(targetRoom.id);
+  if (targetSockets) {
+    for (const ws of Array.from(targetSockets)) {
+      const meta = clientConnections.get(ws);
+      if (meta && meta.playerId === removed.id) {
+        safeWsSend(ws, JSON.stringify({ type: 'player_kicked', reason }));
+        removeClientConnection(ws);
+        const onlineMeta = onlinePlayers.get(ws);
+        if (onlineMeta) {
+          onlineMeta.inRoom = false;
+          onlineMeta.roomId = null;
+        }
+      }
+    }
+  }
+
+  broadcastLog(targetRoom, `🚫 ${removed.name} foi retirado da sala pelo Administrador.`, 'system');
+  syncRoomState(targetRoom);
+  scheduleBroadcastOnlinePlayers();
+
+  return res.json({ success: true, message: `${removed.name} foi retirado da sala com sucesso.` });
+});
+
+// Admin: Direct Alert / Message to Player
+app.post('/api/admin/player-action/alert', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+  const { targetId, message } = req.body;
+  if (!message || !message.trim()) {
+    return res.status(400).json({ success: false, error: 'Mensagem obrigatória.' });
+  }
+
+  let sent = false;
+  for (const [ws, meta] of onlinePlayers.entries()) {
+    if (meta.id === targetId || meta.userId === targetId || meta.name === targetId) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(
+            JSON.stringify({
+              type: 'global_announcement',
+              message: `🔔 Mensagem do Administrador: ${message.trim()}`,
+              sender: '👑 Administração',
+              timestamp: Date.now(),
+            })
+          );
+          sent = true;
+        } catch {}
+      }
+      break;
+    }
+  }
+
+  return res.json({
+    success: true,
+    message: sent ? 'Alerta enviado diretamente na tela do jogador!' : 'Jogador offline ou não encontrado.',
+  });
+});
+
+// In-memory rooms and tournaments repositories (with atomic disk persistence in DATA_DIR)
+const rooms = new Map<string, RoomData>();
+const TOURNAMENTS_FILE = path.join(DATA_DIR, 'tournaments.json');
+
+function atomicWriteTournamentsSyncStrict(tournamentsMap: Map<string, Tournament>): void {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  const arr = Array.from(tournamentsMap.values());
+  const data = JSON.stringify(arr, null, 2);
+  const tempPath = `${TOURNAMENTS_FILE}.tmp.${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const fd = fs.openSync(tempPath, 'w');
+  try {
+    fs.writeSync(fd, data, 0, 'utf-8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tempPath, TOURNAMENTS_FILE);
+}
+
+function atomicWriteTournamentsSync(tournamentsMap: Map<string, Tournament>): void {
+  try {
+    atomicWriteTournamentsSyncStrict(tournamentsMap);
+  } catch (err) {
+    console.error('Failed to atomically save tournaments:', err);
+  }
+}
+
+function loadTournamentsFromDisk(): Map<string, Tournament> {
+  const map = new Map<string, Tournament>();
+  try {
+    if (fs.existsSync(TOURNAMENTS_FILE)) {
+      const raw = fs.readFileSync(TOURNAMENTS_FILE, 'utf-8');
+      const parsed: Tournament[] = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        parsed.forEach((t) => {
+          if (t && t.config && t.config.id) {
+            let activeTournament = t;
+            if (activeTournament.status === 'running') {
+              let modified = false;
+              const recoveredRounds = activeTournament.rounds.map((r) => ({
+                ...r,
+                groups: r.groups.map((g) => ({
+                  ...g,
+                  status: g.status === 'playing' ? ('needs_intervention' as const) : g.status,
+                  games: g.games.map((gm) => ({
+                    ...gm,
+                    status: gm.status === 'playing' ? ('needs_intervention' as const) : gm.status,
+                    roomId: undefined,
+                  })),
+                })),
+              }));
+              if (modified || recoveredRounds.some((r) => r.groups.some((g) => g.status === 'needs_intervention'))) {
+                activeTournament = {
+                  ...activeTournament,
+                  status: 'paused',
+                  pauseReason: 'Servidor reiniciado durante partidas ativas. Requer intervenção administrativa.',
+                  rounds: recoveredRounds,
+                };
+              }
+            }
+            map.set(activeTournament.config.id, activeTournament);
+          }
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load tournaments from disk:', err);
+  }
+  return map;
+}
+
+const tournaments = loadTournamentsFromDisk();
+
+function saveTournaments(targetMap: Map<string, Tournament> = tournaments): void {
+  atomicWriteTournamentsSync(targetMap);
+}
+
+function saveTournamentsStrict(targetMap: Map<string, Tournament> = tournaments): void {
+  atomicWriteTournamentsSyncStrict(targetMap);
+}
+
+function getAuthenticatedRequestUser(req: express.Request) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  return getUserFromToken(authHeader.split(' ')[1]);
+}
+
+function getStrictAdminJwtActor(req: express.Request) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  const user = getUserFromToken(authHeader.split(' ')[1]);
+  if (!user || user.role !== 'admin') return null;
+  return user;
+}
+
+function disconnectUsersFromServer(userIds: string[], reason: string): number {
+  if (!userIds || userIds.length === 0) return 0;
+  const targetSet = new Set(userIds);
+  const allUsers = getAllUsers();
+  const usernamesSet = new Set<string>();
+  for (const u of allUsers) {
+    if (targetSet.has(u.id)) {
+      usernamesSet.add(u.username.toLowerCase());
+    }
+  }
+
+  let closedCount = 0;
+  for (const [ws, meta] of Array.from(onlinePlayers.entries())) {
+    const matchesAuthId = !!(meta.authenticatedUserId && targetSet.has(meta.authenticatedUserId));
+    const matchesUsername = !!(meta.userId && usernamesSet.has(meta.userId.toLowerCase()));
+    const matchesPrefixedId = usernamesSet.size > 0 && Array.from(usernamesSet).some((un) => meta.id === `user-${un}`);
+
+    if (matchesAuthId || matchesUsername || matchesPrefixedId) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: reason }));
+          ws.close(4003, reason);
+        } catch {}
+      }
+      removeClientConnection(ws);
+      onlinePlayers.delete(ws);
+      closedCount++;
+    }
+  }
+
+  // Mark room seats disconnected or remove from waiting non-tournament rooms
+  for (const room of Array.from(rooms.values())) {
+    let changed = false;
+    for (const p of [...room.players]) {
+      if (p.isBot) continue;
+      if ((p.userId && targetSet.has(p.userId)) || usernamesSet.has(p.name.toLowerCase())) {
+        if (room.status === 'waiting' && !room.tournamentId) {
+          room.players = room.players.filter((pl) => pl.id !== p.id);
+          changed = true;
+        } else if (p.isConnected) {
+          p.isConnected = false;
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      const hasHumans = room.players.some((p) => !p.isBot && p.isConnected);
+      if (!hasHumans && !room.tournamentId) {
+        cleanupRoomResources(room);
+      } else {
+        syncRoomState(room);
+      }
+    }
+  }
+
+  if (closedCount > 0) {
+    scheduleBroadcastOnlinePlayers();
+  }
+  return closedCount;
+}
+
+// ============================================================================
+// Importador de Usuários em Massa (JWT Admin Obrigatório)
+// ============================================================================
+
+app.get('/api/admin/import/template', (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito a Administrador autenticado via JWT.' });
+  }
+  const mode =
+    req.query.mode === 'enroll_existing'
+      ? 'enroll_existing'
+      : req.query.mode === 'create_and_enroll'
+        ? 'create_and_enroll'
+        : 'create_only';
+  const csv = buildCsvTemplate(mode);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="modelo_importacao_${mode}.csv"`);
+  return res.send('\uFEFF' + csv);
+});
+
+app.post('/api/admin/import/validate', (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito a Administrador autenticado via JWT.' });
+  }
+
+  const body = req.body || {};
+  const mode =
+    body.mode === 'create_and_enroll' || body.mode === 'enroll_existing' ? body.mode : 'create_only';
+
+  const result = validateImportBatch({
+    rawText: String(body.rawText || ''),
+    mode,
+    delimiter: body.delimiter || 'auto',
+    tournamentId: body.tournamentId ? String(body.tournamentId) : undefined,
+    ignoreExistingUsers: !!body.ignoreExistingUsers,
+    createAsTemporary: body.createAsTemporary === true,
+    tournamentsMap: tournaments,
+  });
+
+  return res.status(result.success ? 200 : 400).json(result);
+});
+
+app.post('/api/admin/import/commit', async (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito a Administrador autenticado via JWT.' });
+  }
+
+  const body = req.body || {};
+  const mode =
+    body.mode === 'create_and_enroll' || body.mode === 'enroll_existing' ? body.mode : 'create_only';
+  const sourceType = body.sourceType === 'csv_upload' ? 'csv_upload' : 'text_paste';
+
+  const result = await commitImportBatch({
+    rawText: String(body.rawText || ''),
+    mode,
+    sourceType,
+    delimiter: body.delimiter || 'auto',
+    tournamentId: body.tournamentId ? String(body.tournamentId) : undefined,
+    ignoreExistingUsers: !!body.ignoreExistingUsers,
+    createAsTemporary: body.createAsTemporary === true,
+    name: String(body.name || ''),
+    importTag: body.importTag ? String(body.importTag) : undefined,
+    description: body.description ? String(body.description) : undefined,
+    idempotencyKey: body.idempotencyKey ? String(body.idempotencyKey) : undefined,
+    actor: { id: adminActor.id, username: adminActor.username },
+    tournamentsMap: tournaments,
+    saveTournamentsFn: saveTournaments,
+  });
+
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
+  return res.status(result.idempotentHit ? 200 : 201).json(result);
+});
+
+app.get('/api/admin/import/batches', async (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito a Administrador autenticado via JWT.' });
+  }
+
+  await reconcileIncompleteImportBatches(tournaments, saveTournaments);
+  const batches = listImportBatches({
+    search: typeof req.query.search === 'string' ? req.query.search : undefined,
+    mode:
+      req.query.mode === 'create_only' || req.query.mode === 'create_and_enroll' || req.query.mode === 'enroll_existing'
+        ? req.query.mode
+        : 'all',
+    status: typeof req.query.status === 'string' ? req.query.status : 'all',
+  });
+
+  return res.json({ success: true, batches });
+});
+
+app.get('/api/admin/import/batches/:batchId', async (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito a Administrador autenticado via JWT.' });
+  }
+
+  await reconcileIncompleteImportBatches(tournaments, saveTournaments);
+  const details = getImportBatchDetails(req.params.batchId, tournaments);
+  if (!details) {
+    return res.status(404).json({ success: false, error: 'Lote de importação não encontrado.' });
+  }
+  return res.json({ success: true, ...details });
+});
+
+app.post('/api/admin/import/batches/:batchId/users/impact', (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito a Administrador autenticado via JWT.' });
+  }
+
+  const body = req.body || {};
+  const userIds = Array.isArray(body.userIds) ? body.userIds.map(String) : [];
+  const requestedAction =
+    body.action === 'disable' || body.action === 'archive' || body.action === 'reactivate' || body.action === 'delete'
+      ? body.action
+      : 'disable';
+
+  const impact = analyzeImportBatchUsersImpact({
+    batchId: req.params.batchId,
+    userIds,
+    requestedAction,
+    tournamentsMap: tournaments,
+    roomsMap: rooms,
+    statsMap: getAllStats(),
+  });
+
+  if (!impact) {
+    return res.status(404).json({ success: false, error: 'Lote de importação não encontrado.' });
+  }
+  return res.json({ success: true, impact });
+});
+
+app.post('/api/admin/import/batches/:batchId/users/manage', async (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito a Administrador autenticado via JWT.' });
+  }
+
+  const body = req.body || {};
+  const userIds = Array.isArray(body.userIds) ? body.userIds.map(String) : [];
+  const action =
+    body.action === 'disable' || body.action === 'archive' || body.action === 'reactivate' || body.action === 'delete'
+      ? body.action
+      : null;
+
+  if (!action || userIds.length === 0) {
+    return res.status(400).json({ success: false, error: 'Informe a ação e ao menos um usuário.' });
+  }
+
+  const result = await manageImportBatchUsers({
+    batchId: req.params.batchId,
+    userIds,
+    action,
+    reason: body.reason ? String(body.reason) : undefined,
+    actor: { id: adminActor.id, username: adminActor.username },
+    tournamentsMap: tournaments,
+    roomsMap: rooms,
+    statsMap: getAllStats(),
+  });
+
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
+
+  if ((action === 'disable' || action === 'archive' || action === 'delete') && result.affectedUserIds.length > 0) {
+    const disconnectReason =
+      action === 'delete'
+        ? 'Sua conta foi removida pelo administrador.'
+        : action === 'archive'
+          ? 'Sua conta foi arquivada pelo administrador.'
+          : 'Sua conta foi desativada pelo administrador.';
+    disconnectUsersFromServer(result.affectedUserIds, disconnectReason);
+  }
+
+  return res.json(result);
+});
+
+function getSpectatorPermissionForTournament(mode: TournamentConfig['spectatorMode']): 'disabled' | 'hidden_cards' | 'reveal_cards' {
+  if (mode === 'table_only') return 'disabled';
+  if (mode === 'tv_reveal') return 'reveal_cards';
+  return 'hidden_cards';
+}
+
+function createTournamentRoomForGame(
+  tournament: Tournament,
+  group: TournamentGroup,
+  game: TournamentGame
+): RoomData {
+  if (game.roomId && rooms.has(game.roomId)) {
+    return rooms.get(game.roomId)!;
+  }
+
+  let roomId = generateRoomId();
+  while (rooms.has(roomId)) {
+    roomId = generateRoomId();
+  }
+
+  const users = getAllUsers();
+  const isDoubles = tournament.config.modality === 'doubles';
+  const seatedPlayers: InternalPlayer[] = [];
+
+  if (isDoubles) {
+    if (game.participantEntryIds.length !== 2) {
+      throw new Error('Confronto de duplas 2v2 exige exatamente 2 equipes participantes.');
+    }
+
+    const buildTeamSeats = (entryId: string, teamLabel: 'A' | 'B'): InternalPlayer[] => {
+      const entry = tournament.entries.find((e) => e.id === entryId);
+      if (!entry || entry.userIds.length !== 2) {
+        throw new Error(`Equipe "${entryId}" inválida para partida 2v2.`);
+      }
+      return entry.userIds.map((userId, memberIdx) => {
+        const userRecord = users.find((u) => u.id === userId || u.username === userId);
+        const canonicalUserId = userRecord ? userRecord.id : userId;
+        return {
+          id: `${entry.id}__${canonicalUserId}`,
+          userId: canonicalUserId,
+          tournamentEntryId: entry.id,
+          team: teamLabel,
+          name: userRecord?.displayName || `${entry.name} #${memberIdx + 1}`,
+          avatar: userRecord?.avatar || '🎮',
+          isHost: teamLabel === 'A' && memberIdx === 0,
+          isBot: false,
+          cardsCount: 0,
+          hasCalledUno: false,
+          isConnected: false,
+          score: 0,
+          hand: [],
+          hasDrawnThisTurn: false,
+        };
+      });
+    };
+
+    const teamASeats = buildTeamSeats(game.participantEntryIds[0], 'A');
+    const teamBSeats = buildTeamSeats(game.participantEntryIds[1], 'B');
+    // Assentos alternados: A1, B1, A2, B2
+    seatedPlayers.push(teamASeats[0], teamBSeats[0], teamASeats[1], teamBSeats[1]);
+  } else {
+    game.participantEntryIds.forEach((entryId, idx) => {
+      const entry = tournament.entries.find((e) => e.id === entryId);
+      const userId = entry?.userIds[0];
+      const userRecord = users.find((u) => u.id === userId || u.username === userId);
+      const canonicalUserId = userRecord ? userRecord.id : userId;
+
+      seatedPlayers.push({
+        id: entry ? `${entry.id}` : `seat_${idx}_${game.id}`,
+        userId: canonicalUserId,
+        tournamentEntryId: entryId,
+        name: userRecord?.displayName || entry?.name || `Jogador ${idx + 1}`,
+        avatar: userRecord?.avatar || '🎮',
+        isHost: idx === 0,
+        isBot: false,
+        cardsCount: 0,
+        hasCalledUno: false,
+        isConnected: false,
+        score: 0,
+        hand: [],
+        hasDrawnThisTurn: false,
+      });
+    });
+  }
+
+  const turnDuration = tournament.config.turnDurationSeconds ?? 30;
+  const spectatorPermission = getSpectatorPermissionForTournament(tournament.config.spectatorMode);
+
+  const room: RoomData = {
+    id: roomId,
+    creatorName: 'Sistema de Torneio',
+    ownerUserId: tournament.createdByUserId,
+    tournamentId: tournament.config.id,
+    tournamentGroupId: group.id,
+    tournamentGameId: game.id,
+    tournamentSpectatorMode: tournament.config.spectatorMode,
+    woRemovedPlayerIds: [],
+    pendingWoPlayerIds: [],
+    settings: {
+      maxPlayers: isDoubles ? 4 : Math.max(2, seatedPlayers.length),
+      gameMode: isDoubles ? 'team_2v2' : 'standard',
+      turnDuration,
+      challengeUnoRule: true,
+      showBotCards: false,
+      autoUnoProtection: false,
+      highlightHints: true,
+      spectatorPermission,
+      spectatorMode: tournament.config.spectatorMode === 'tv_reveal' ? 'reveal_cards' : 'hidden_cards',
+      playAnimationDelay: tournament.config.playAnimationDelaySeconds ?? 1.5,
+      isPrivate: true,
+      tournamentId: tournament.config.id,
+      tournamentFormat: isDoubles ? 'doubles_elimination' : 'single_elimination',
+    },
+    status: 'waiting',
+    players: seatedPlayers,
+    deck: [],
+    discardPile: [],
+    currentColor: 'red',
+    currentTurnIndex: 0,
+    turnDirection: 1,
+    turnTimeLeft: turnDuration > 0 ? turnDuration : 999,
+    winnerId: null,
+    winnerTeam: null,
+    unoVulnerablePlayerId: null,
+    spectatorCardsRevealed: tournament.config.spectatorMode === 'tv_reveal',
+    turnTimerInterval: null,
+    botTimerTimeout: null,
+  };
+
+  rooms.set(roomId, room);
+  game.roomId = roomId;
+  return room;
+}
+
+function launchNextPendingTournamentGames(tournament: Tournament): { tournament: Tournament; createdRoomIds: string[] } {
+  const createdRoomIds: string[] = [];
+  if (tournament.status !== 'running') {
+    return { tournament, createdRoomIds };
+  }
+  const currentRound = tournament.rounds[tournament.rounds.length - 1];
+  if (!currentRound) return { tournament, createdRoomIds };
+
+  const updatedRounds = tournament.rounds.map((r, rIdx) => {
+    if (rIdx !== tournament.rounds.length - 1) return r;
+    const updatedGroups = r.groups.map((grp) => {
+      if (grp.status === 'finished' || grp.status === 'needs_intervention' || grp.status === 'tiebreaker_required') {
+        return grp;
+      }
+      const alreadyPlaying = grp.games.some((g) => g.status === 'playing' && g.roomId && rooms.has(g.roomId));
+      if (alreadyPlaying) return grp;
+
+      const nextPendingIdx = grp.games.findIndex((g) => g.status === 'pending');
+      if (nextPendingIdx === -1) return grp;
+
+      const clonedGame: TournamentGame = { ...grp.games[nextPendingIdx] };
+      const room = createTournamentRoomForGame(tournament, grp, clonedGame);
+      clonedGame.roomId = room.id;
+      clonedGame.status = 'playing';
+      createdRoomIds.push(room.id);
+
+      const updatedGames = grp.games.map((g, idx) => (idx === nextPendingIdx ? clonedGame : g));
+      return {
+        ...grp,
+        status: 'playing' as const,
+        games: updatedGames,
+      };
+    });
+    return { ...r, groups: updatedGroups };
+  });
+
+  const nextTournament: Tournament = { ...tournament, rounds: updatedRounds };
+  tournaments.set(nextTournament.config.id, nextTournament);
+  return { tournament: nextTournament, createdRoomIds };
+}
+
+function handleTournamentGameCompleted(
+  room: RoomData,
+  params: {
+    eventId: string;
+    winnerEntryId?: string;
+    resultReason: 'normal' | 'wo' | 'void_insufficient_players';
+    woEntryIds?: string[];
+    roundPointsWon?: number;
+  }
+) {
+  if (!room.tournamentId || !room.tournamentGameId) return;
+  const currentTournament = tournaments.get(room.tournamentId);
+  if (!currentTournament) return;
+
+  const outcome = recordGameResult(currentTournament, {
+    gameId: room.tournamentGameId,
+    eventId: params.eventId,
+    winnerEntryId: params.winnerEntryId,
+    resultReason: params.resultReason,
+    woEntryIds: params.woEntryIds,
+    roundPointsWon: params.roundPointsWon,
+    finishedAt: Date.now(),
+  });
+
+  if (!outcome.applied) return;
+
+  let nextTournament = outcome.tournament;
+  const lastRound = nextTournament.rounds[nextTournament.rounds.length - 1];
+  if (lastRound && lastRound.groups.every((g) => g.status === 'finished') && nextTournament.status === 'running') {
+    nextTournament = advanceTournamentRound(nextTournament, Date.now());
+  }
+
+  tournaments.set(nextTournament.config.id, nextTournament);
+  saveTournaments();
+
+  if (nextTournament.status === 'running') {
+    launchNextPendingTournamentGames(nextTournament);
+    saveTournaments();
+  }
+}
+
+function parseOptionalScheduledAtMs(raw: unknown): { valid: boolean; value?: number | null; error?: string } {
+  if (raw === undefined) return { valid: true, value: undefined };
+  if (raw === null || raw === '') return { valid: true, value: null };
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw <= 0) return { valid: false, error: 'Data/hora agendada inválida.' };
+    return { valid: true, value: raw };
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return { valid: true, value: null };
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric) && /^\d+$/.test(trimmed)) {
+      return numeric > 0 ? { valid: true, value: numeric } : { valid: false, error: 'Data/hora agendada inválida.' };
+    }
+    const parsed = Date.parse(trimmed);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return { valid: false, error: 'Formato de data/hora inválido.' };
+    }
+    return { valid: true, value: parsed };
+  }
+  return { valid: false, error: 'Formato de data/hora inválido.' };
+}
+
+// REST Endpoints de Torneios (Etapas 3 e 4: Individual Multi-Mesa e Duplas 2v2)
+app.post('/api/tournaments', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  const perm = assertTournamentAdmin(user?.role);
+  if (!user || !perm.allowed) {
+    return res.status(403).json({ success: false, error: perm.error || 'Acesso restrito ao Administrador.' });
+  }
+
+  try {
+    const body = req.body || {};
+    const parsedSchedule = parseOptionalScheduledAtMs(body.scheduledAt);
+    if (!parsedSchedule.valid) {
+      return res.status(400).json({ success: false, error: parsedSchedule.error });
+    }
+
+    const config: TournamentConfig = {
+      id: (body.id && String(body.id).trim()) || `tourn_${crypto.randomBytes(4).toString('hex')}`,
+      name: String(body.name || '').trim(),
+      modality: body.modality === 'doubles' ? 'doubles' : 'individual',
+      bestOf: body.bestOf,
+      gamesPerGroup: body.gamesPerGroup ?? 3,
+      advancePerGroup: body.advancePerGroup ?? 1,
+      tieBreakerPolicy: body.tieBreakerPolicy === 'admin_decision' ? 'admin_decision' : 'extra_match',
+      reconnectGraceMs: body.reconnectGraceMs ?? 45_000,
+      spectatorMode:
+        body.spectatorMode === 'tv_hidden' || body.spectatorMode === 'tv_reveal'
+          ? body.spectatorMode
+          : 'table_only',
+      turnDurationSeconds: body.turnDurationSeconds ?? 30,
+      playAnimationDelaySeconds: body.playAnimationDelaySeconds,
+      seed: body.seed,
+    };
+
+    const tournament = createTournament(config, user.id, Date.now(), {
+      scheduledAt: parsedSchedule.value ?? undefined,
+      createdByUsername: user.username,
+    });
+    tournaments.set(tournament.config.id, tournament);
+    saveTournaments();
+    return res.status(201).json({ success: true, tournament });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, error: err?.message || 'Erro ao criar torneio.' });
+  }
+});
+
+app.get('/api/tournaments', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Autenticação necessária.' });
+  }
+  return res.json({ success: true, tournaments: Array.from(tournaments.values()) });
+});
+
+app.get('/api/tournaments/:id', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Autenticação necessária.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+
+  const standingsByGroup: Record<string, ReturnType<typeof rankIndividualGroupEntries>> = {};
+  const seriesSummaryByGroup: Record<string, { bestOf: number; winsNeeded: number; winsByEntryId: Record<string, number> }> = {};
+
+  for (const r of tournament.rounds) {
+    for (const g of r.groups) {
+      if (g.rule.type === 'points') {
+        standingsByGroup[g.id] = rankIndividualGroupEntries(g, tournament.config.tieBreakerPolicy);
+      } else if (g.rule.type === 'series') {
+        const winsByEntryId: Record<string, number> = {};
+        for (const eid of g.entryIds) winsByEntryId[eid] = 0;
+        for (const gm of g.games) {
+          if (gm.status === 'finished' && gm.winnerEntryId) {
+            winsByEntryId[gm.winnerEntryId] = (winsByEntryId[gm.winnerEntryId] || 0) + 1;
+          }
+        }
+        seriesSummaryByGroup[g.id] = {
+          bestOf: g.rule.bestOf,
+          winsNeeded: Math.floor(g.rule.bestOf / 2) + 1,
+          winsByEntryId,
+        };
+      }
+    }
+  }
+
+  return res.json({ success: true, tournament, standingsByGroup, seriesSummaryByGroup });
+});
+
+app.post('/api/tournaments/:id/simulate', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  const perm = assertTournamentAdmin(user?.role);
+  if (!user || !perm.allowed) {
+    return res.status(403).json({ success: false, error: perm.error || 'Acesso restrito ao Administrador.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+  const count = Number(req.body?.entryCount ?? tournament.entries.length);
+  const simulation = simulateTournament(tournament.config, count);
+  return res.json({ success: true, simulation });
+});
+
+app.post('/api/tournaments/:id/register', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Autenticação necessária para inscrição.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+  if (tournament.config.modality === 'doubles') {
+    return res.status(400).json({
+      success: false,
+      error: 'Torneios de duplas exigem inscrição de equipe (2 jogadores) via /api/tournaments/:id/teams.',
+    });
+  }
+
+  try {
+    let targetUser = user;
+    const requestedTarget = req.body?.userId || req.body?.username;
+    if (requestedTarget && requestedTarget !== user.id && requestedTarget !== user.username) {
+      const perm = assertTournamentAdmin(user.role);
+      if (!perm.allowed) {
+        return res.status(403).json({ success: false, error: 'Apenas administradores podem inscrever terceiros.' });
+      }
+      const found = getAllUsers().find((u) => u.id === requestedTarget || u.username === requestedTarget);
+      if (!found) {
+        return res.status(404).json({ success: false, error: 'Usuário informado não encontrado.' });
+      }
+      if (!isUserAccountActive(found)) {
+        return res.status(400).json({ success: false, error: 'Esta conta está desativada ou arquivada e não pode ser inscrita em torneios.' });
+      }
+      targetUser = {
+        id: found.id,
+        username: found.username,
+        displayName: found.displayName,
+        avatar: found.avatar,
+        role: found.role,
+        tag: found.tag,
+        createdAt: found.createdAt,
+      };
+    }
+
+    const result = registerIndividualEntry(tournament, targetUser.id, targetUser.displayName || targetUser.username);
+    tournaments.set(tournament.config.id, result.tournament);
+    saveTournaments();
+    return res.json({ success: true, tournament: result.tournament, entry: result.entry });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, error: err?.message || 'Erro ao inscrever no torneio.' });
+  }
+});
+
+app.post('/api/tournaments/:id/teams', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  const perm = assertTournamentAdmin(user?.role);
+  if (!user || !perm.allowed) {
+    return res.status(403).json({ success: false, error: perm.error || 'Acesso restrito ao Administrador.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+
+  try {
+    const body = req.body || {};
+    const rawUserIds: unknown[] = Array.isArray(body.userIds) ? body.userIds : [];
+    if (rawUserIds.length !== 2) {
+      return res.status(400).json({ success: false, error: 'Informe exatamente 2 jogadores distintos para formar a dupla.' });
+    }
+
+    const allUsers = getAllUsers();
+    const resolveUser = (ident: string) => {
+      const clean = String(ident || '').trim();
+      return allUsers.find((u) => u.id === clean || u.username.toLowerCase() === clean.toLowerCase());
+    };
+
+    const u1 = resolveUser(String(rawUserIds[0]));
+    const u2 = resolveUser(String(rawUserIds[1]));
+    if (!u1 || !u2) {
+      return res.status(404).json({ success: false, error: 'Um ou ambos os usuários informados não existem.' });
+    }
+    if (!isUserAccountActive(u1) || !isUserAccountActive(u2)) {
+      return res.status(400).json({ success: false, error: 'Contas desativadas ou arquivadas não podem ser inscritas em equipes.' });
+    }
+
+    const teamId = (body.teamId && String(body.teamId).trim()) || `team_${crypto.randomBytes(4).toString('hex')}`;
+    const teamName = String(body.name || `${u1.displayName} & ${u2.displayName}`).trim();
+    const result = registerDoublesTeam(tournament, teamId, teamName, [u1.id, u2.id]);
+    tournaments.set(tournament.config.id, result.tournament);
+    saveTournaments();
+    return res.status(201).json({ success: true, tournament: result.tournament, entry: result.entry });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, error: err?.message || 'Erro ao cadastrar equipe.' });
+  }
+});
+
+app.put('/api/tournaments/:id/teams/:teamId', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  const perm = assertTournamentAdmin(user?.role);
+  if (!user || !perm.allowed) {
+    return res.status(403).json({ success: false, error: perm.error || 'Acesso restrito ao Administrador.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+
+  try {
+    const rawUserIds: unknown[] = Array.isArray(req.body?.userIds) ? req.body.userIds : [];
+    if (rawUserIds.length !== 2) {
+      return res.status(400).json({ success: false, error: 'Informe exatamente 2 jogadores distintos para a dupla.' });
+    }
+    const allUsers = getAllUsers();
+    const resolveUser = (ident: string) => {
+      const clean = String(ident || '').trim();
+      return allUsers.find((u) => u.id === clean || u.username.toLowerCase() === clean.toLowerCase());
+    };
+    const u1 = resolveUser(String(rawUserIds[0]));
+    const u2 = resolveUser(String(rawUserIds[1]));
+    if (!u1 || !u2) {
+      return res.status(404).json({ success: false, error: 'Um ou ambos os usuários informados não existem.' });
+    }
+    if (!isUserAccountActive(u1) || !isUserAccountActive(u2)) {
+      return res.status(400).json({ success: false, error: 'Contas desativadas ou arquivadas não podem integrar equipes.' });
+    }
+
+    const updated = updateDoublesTeamMembers(tournament, req.params.teamId, [u1.id, u2.id]);
+    tournaments.set(tournament.config.id, updated);
+    saveTournaments();
+    return res.json({ success: true, tournament: updated });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, error: err?.message || 'Erro ao atualizar equipe.' });
+  }
+});
+
+app.post('/api/tournaments/:id/start', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  const perm = assertTournamentAdmin(user?.role);
+  if (!user || !perm.allowed) {
+    return res.status(403).json({ success: false, error: perm.error || 'Acesso restrito ao Administrador.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+
+  try {
+    const started = startTournament(tournament, Date.now());
+    const launched = launchNextPendingTournamentGames(started);
+    saveTournaments();
+    return res.json({
+      success: true,
+      tournament: launched.tournament,
+      createdRoomIds: launched.createdRoomIds,
+    });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, error: err?.message || 'Erro ao iniciar torneio.' });
+  }
+});
+
+app.post('/api/tournaments/:id/games/:gameId/start', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  const perm = assertTournamentAdmin(user?.role);
+  if (!user || !perm.allowed) {
+    return res.status(403).json({ success: false, error: perm.error || 'Acesso restrito ao Administrador.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+  if (isTournamentEnded(tournament) || tournament.status !== 'running') {
+    return res.status(400).json({
+      success: false,
+      error: `Não é possível iniciar partidas quando o torneio está com status "${tournament.status}".`,
+    });
+  }
+
+  let foundGame: TournamentGame | undefined;
+  for (const r of tournament.rounds) {
+    for (const g of r.groups) {
+      const gm = g.games.find((item) => item.id === req.params.gameId);
+      if (gm) {
+        foundGame = gm;
+        break;
+      }
+    }
+    if (foundGame) break;
+  }
+
+  if (!foundGame || !foundGame.roomId) {
+    return res.status(404).json({ success: false, error: 'Partida ou sala vinculada não encontrada.' });
+  }
+
+  const room = rooms.get(foundGame.roomId);
+  if (!room) {
+    return res.status(404).json({ success: false, error: 'Sala de torneio não está ativa na memória.' });
+  }
+  if (room.status !== 'waiting') {
+    return res.status(400).json({ success: false, error: 'Partida já foi iniciada ou encerrada.' });
+  }
+  if (room.players.some((p) => p.isBot)) {
+    return res.status(400).json({ success: false, error: 'Salas de torneio não permitem robôs.' });
+  }
+  if (room.players.some((p) => !p.isConnected)) {
+    return res.status(400).json({ success: false, error: 'Aguardando todos os jogadores escalados conectarem à mesa.' });
+  }
+
+  startGame(room);
+  return res.json({ success: true, roomId: room.id, status: room.status });
+});
+
+app.post('/api/tournaments/:id/groups/:groupId/tiebreaker', (req, res) => {
+  const user = getAuthenticatedRequestUser(req);
+  const perm = assertTournamentAdmin(user?.role);
+  if (!user || !perm.allowed) {
+    return res.status(403).json({ success: false, error: perm.error || 'Acesso restrito ao Administrador.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+  if (tournament.status !== 'running') {
+    return res.status(400).json({ success: false, error: 'Torneio não está em execução.' });
+  }
+
+  const currentRound = tournament.rounds[tournament.rounds.length - 1];
+  const group = currentRound?.groups.find((g) => g.id === req.params.groupId);
+  if (!group || group.status !== 'tiebreaker_required') {
+    return res.status(400).json({ success: false, error: 'Mesa não está aguardando partida de desempate.' });
+  }
+
+  const classification = rankIndividualGroupEntries(group, tournament.config.tieBreakerPolicy);
+  if (classification.status !== 'tiebreaker_required') {
+    return res.status(400).json({ success: false, error: 'Não há empate na linha de corte.' });
+  }
+
+  const updatedGroup = createTieBreakerGame(group, classification.tiedEntryIds);
+  const updatedRounds = tournament.rounds.map((r, rIdx) =>
+    rIdx === tournament.rounds.length - 1
+      ? { ...r, groups: r.groups.map((g) => (g.id === group.id ? updatedGroup : g)) }
+      : r
+  );
+  const updatedTournament: Tournament = { ...tournament, rounds: updatedRounds };
+  const launched = launchNextPendingTournamentGames(updatedTournament);
+  return res.json({ success: true, tournament: launched.tournament, createdRoomIds: launched.createdRoomIds });
+});
+
+// Admin: Editar torneio (preserva regras após início e bloqueia se já encerrado)
+app.put('/api/tournaments/:id', async (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador autenticado via JWT.' });
+  }
+
+  return withDataLock(() => {
+    const tournament = tournaments.get(req.params.id);
+    if (!tournament) {
+      return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+    }
+
+    const body = req.body || {};
+    const parsedSchedule = parseOptionalScheduledAtMs(body.scheduledAt);
+    if (!parsedSchedule.valid) {
+      return res.status(400).json({ success: false, error: parsedSchedule.error });
+    }
+
+    try {
+      const updated = updateTournamentDetails(
+        tournament,
+        {
+          name: body.name,
+          spectatorMode: body.spectatorMode,
+          turnDurationSeconds: body.turnDurationSeconds !== undefined ? Number(body.turnDurationSeconds) : undefined,
+          reconnectGraceMs: body.reconnectGraceMs !== undefined ? Number(body.reconnectGraceMs) : undefined,
+          bestOf: body.bestOf !== undefined ? (Number(body.bestOf) as 1 | 3 | 5) : undefined,
+          gamesPerGroup: body.gamesPerGroup !== undefined ? Number(body.gamesPerGroup) : undefined,
+          advancePerGroup: body.advancePerGroup !== undefined ? (Number(body.advancePerGroup) as 1 | 2) : undefined,
+          tieBreakerPolicy: body.tieBreakerPolicy,
+          scheduledAt: parsedSchedule.value,
+        },
+        { userId: adminActor.id, username: adminActor.username },
+        Date.now()
+      );
+      tournaments.set(updated.config.id, updated);
+      saveTournamentsStrict();
+
+      const nowMs = Date.now();
+      appendTournamentAuditLogStrict({
+        id: `taud_${nowMs}_${crypto.randomBytes(3).toString('hex')}`,
+        at: new Date(nowMs).toISOString(),
+        timestampMs: nowMs,
+        action: 'tournament_edited',
+        actorUserId: adminActor.id,
+        actorUsername: adminActor.username,
+        tournamentId: updated.config.id,
+        tournamentName: updated.config.name,
+        tournamentStatus: updated.status,
+        details: `Configurações do torneio "${updated.config.name}" editadas por @${adminActor.username}.`,
+      });
+
+      return res.json({ success: true, tournament: updated });
+    } catch (err: any) {
+      return res.status(400).json({ success: false, error: err?.message || 'Erro ao atualizar torneio.' });
+    }
+  });
+});
+
+// Admin: Reagendar torneio para nova data sem encerrá-lo
+app.post('/api/tournaments/:id/reschedule', async (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador autenticado via JWT.' });
+  }
+
+  return withDataLock(() => {
+    const tournament = tournaments.get(req.params.id);
+    if (!tournament) {
+      return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+    }
+
+    const liveRooms = Array.from(rooms.values()).filter(
+      (r) => r.tournamentId === tournament.config.id && r.status === 'playing'
+    );
+    if (liveRooms.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: `Existem ${liveRooms.length} partida(s) em andamento na mesa (${liveRooms.map((r) => `#${r.id}`).join(', ')}). Aguarde o término antes de reagendar.`,
+      });
+    }
+
+    const parsedSchedule = parseOptionalScheduledAtMs(req.body?.scheduledAt);
+    if (!parsedSchedule.valid || !parsedSchedule.value) {
+      return res.status(400).json({
+        success: false,
+        error: parsedSchedule.error || 'Informe uma data e hora válida para o reagendamento.',
+      });
+    }
+
+    try {
+      const nowMs = Date.now();
+      const updated = rescheduleTournament(
+        tournament,
+        {
+          scheduledAt: parsedSchedule.value,
+          reason: req.body?.reason ? String(req.body.reason) : undefined,
+        },
+        { userId: adminActor.id, username: adminActor.username },
+        nowMs
+      );
+
+      tournaments.set(updated.config.id, updated);
+      saveTournamentsStrict();
+
+      appendTournamentAuditLogStrict({
+        id: `taud_${nowMs}_${crypto.randomBytes(3).toString('hex')}`,
+        at: new Date(nowMs).toISOString(),
+        timestampMs: nowMs,
+        action: 'tournament_rescheduled',
+        actorUserId: adminActor.id,
+        actorUsername: adminActor.username,
+        tournamentId: updated.config.id,
+        tournamentName: updated.config.name,
+        tournamentStatus: updated.status,
+        details: `Torneio "${updated.config.name}" reagendado para ${new Date(parsedSchedule.value).toISOString()} por @${adminActor.username}.`,
+      });
+
+      return res.json({ success: true, tournament: updated });
+    } catch (err: any) {
+      return res.status(400).json({ success: false, error: err?.message || 'Erro ao reagendar torneio.' });
+    }
+  });
+});
+
+// Admin: Encerrar torneio (preserva resultados, histórico, estatísticas e TODOS os usuários)
+app.post('/api/tournaments/:id/close', async (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador autenticado via JWT.' });
+  }
+
+  return withDataLock(() => {
+    const tournament = tournaments.get(req.params.id);
+    if (!tournament) {
+      return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+    }
+    if (isTournamentEnded(tournament)) {
+      return res.status(400).json({
+        success: false,
+        error: `Este torneio já está finalizado/encerrado (status: ${tournament.status}).`,
+      });
+    }
+
+    const linkedRooms = Array.from(rooms.values()).filter((r) => r.tournamentId === tournament.config.id);
+    const liveMatches = linkedRooms.filter((r) => r.status === 'playing' || r.status === 'paused');
+    if (liveMatches.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 'ACTIVE_MATCHES_IN_PROGRESS',
+        activeRoomIds: liveMatches.map((r) => r.id),
+        error: `Existem ${liveMatches.length} partida(s) em andamento na mesa (${liveMatches.map((r) => `#${r.id}`).join(', ')}). Aguarde o término das partidas antes de encerrar o torneio para não interromper jogos nem produzir resultados artificiais.`,
+      });
+    }
+
+    const unstartedWaitingRooms = linkedRooms.filter((r) => r.status === 'waiting');
+    const unstartedGameIds = unstartedWaitingRooms
+      .map((r) => r.tournamentGameId)
+      .filter((gid): gid is string => Boolean(gid));
+
+    try {
+      const nowMs = Date.now();
+      const closed = closeTournament(
+        tournament,
+        {
+          reason: req.body?.reason ? String(req.body.reason) : undefined,
+          unstartedGameIds,
+        },
+        { userId: adminActor.id, username: adminActor.username },
+        nowMs
+      );
+
+      tournaments.set(closed.config.id, closed);
+      saveTournamentsStrict();
+
+      appendTournamentAuditLogStrict({
+        id: `taud_${nowMs}_${crypto.randomBytes(3).toString('hex')}`,
+        at: new Date(nowMs).toISOString(),
+        timestampMs: nowMs,
+        action: 'tournament_closed',
+        actorUserId: adminActor.id,
+        actorUsername: adminActor.username,
+        tournamentId: closed.config.id,
+        tournamentName: closed.config.name,
+        tournamentStatus: closed.status,
+        details: `Torneio "${closed.config.name}" encerrado por @${adminActor.username}. Histórico, resultados e usuários preservados.`,
+      });
+
+      // Limpar apenas salas não iniciadas em espera, notificando quem estivesse aguardando na mesa
+      for (const waitingRoom of unstartedWaitingRooms) {
+        const sockets = roomSockets.get(waitingRoom.id);
+        if (sockets) {
+          for (const wsClient of Array.from(sockets)) {
+            if (wsClient.readyState === WebSocket.OPEN) {
+              try {
+                wsClient.send(
+                  JSON.stringify({
+                    type: 'player_kicked',
+                    reason: `O torneio "${closed.config.name}" foi encerrado pelo administrador.`,
+                  })
+                );
+              } catch {}
+            }
+            removeClientConnection(wsClient);
+            const meta = onlinePlayers.get(wsClient);
+            if (meta) {
+              meta.roomId = null;
+              meta.inRoom = false;
+            }
+          }
+        }
+        if (waitingRoom.turnTimerInterval) clearInterval(waitingRoom.turnTimerInterval);
+        if (waitingRoom.botTimerTimeout) clearTimeout(waitingRoom.botTimerTimeout);
+        if (waitingRoom.stagedCardTimeout) clearTimeout(waitingRoom.stagedCardTimeout);
+        if (waitingRoom.emptyRoomTimeout) clearTimeout(waitingRoom.emptyRoomTimeout);
+        rooms.delete(waitingRoom.id);
+      }
+      if (unstartedWaitingRooms.length > 0) {
+        scheduleBroadcastOnlinePlayers();
+      }
+
+      return res.json({
+        success: true,
+        tournament: closed,
+        message: 'Torneio encerrado com sucesso. Resultados, histórico, estatísticas e usuários foram preservados.',
+      });
+    } catch (err: any) {
+      return res.status(400).json({ success: false, error: err?.message || 'Erro ao encerrar torneio.' });
+    }
+  });
+});
+
+// Admin: Gerar desafio matemático e diagnóstico para exclusão de usuários temporários do torneio
+app.post('/api/tournaments/:id/temporary-users/challenge', (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador autenticado via JWT.' });
+  }
+
+  const result = createTournamentTempUsersChallenge({
+    tournamentId: req.params.id,
+    actor: adminActor,
+    tournamentsMap: tournaments,
+    roomsMap: rooms,
+  });
+
+  if (!result.success) {
+    return res.status(404).json(result);
+  }
+  return res.json(result);
+});
+
+// Admin: Executar exclusão transacional de usuários temporários após validação matemática no servidor
+app.post('/api/tournaments/:id/temporary-users/delete', async (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador autenticado via JWT.' });
+  }
+
+  const body = req.body || {};
+  const result = await executeTournamentTempUsersCleanup({
+    tournamentId: req.params.id,
+    challengeId: String(body.challengeId || ''),
+    answer: body.answer,
+    reason: body.reason ? String(body.reason) : undefined,
+    actor: adminActor,
+    tournamentsMap: tournaments,
+    roomsMap: rooms,
+    deps: {
+      saveTournamentsFn: saveTournamentsStrict,
+      getAllStatsFn: getAllStats,
+      saveStatsFn: saveStatsStrict,
+    },
+  });
+
+  if (result.success && result.deletedUserIds && result.deletedUserIds.length > 0) {
+    disconnectUsersFromServer(
+      result.deletedUserIds,
+      'Sua conta temporária de torneio foi removida após encerramento.'
+    );
+  }
+
+  return res.status(result.status).json(result);
+});
+
+// Admin: Consultar auditoria do torneio
+app.get('/api/tournaments/:id/audit', (req, res) => {
+  const adminActor = getStrictAdminJwtActor(req);
+  if (!adminActor) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador autenticado via JWT.' });
+  }
+  const tournament = tournaments.get(req.params.id);
+  if (!tournament) {
+    return res.status(404).json({ success: false, error: 'Torneio não encontrado.' });
+  }
+  const logs = loadTournamentAuditLogs().filter((l) => l.tournamentId === tournament.config.id);
+  return res.json({
+    success: true,
+    tournamentAuditTrail: tournament.auditTrail || [],
+    centralAuditLogs: logs,
+  });
+});
+
+interface ConnectionMeta {
+  socketId: string;
+  roomId: string;
+  playerId: string;
+  reconnectToken: string;
+}
+
+// Map client WebSocket to connection metadata + O(1) index of sockets per roomId
+const clientConnections = new Map<WebSocket, ConnectionMeta>();
+const roomSockets = new Map<string, Set<WebSocket>>();
+
+function safeWsSend(ws: WebSocket, payload: string, maxBufferedBytes?: number): boolean {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  if (maxBufferedBytes !== undefined && ws.bufferedAmount > maxBufferedBytes) {
+    return false;
+  }
+  try {
+    ws.send(payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function addSocketToRoomIndex(roomId: string, ws: WebSocket) {
+  let set = roomSockets.get(roomId);
+  if (!set) {
+    set = new Set<WebSocket>();
+    roomSockets.set(roomId, set);
+  }
+  set.add(ws);
+}
+
+function removeSocketFromRoomIndex(roomId: string, ws: WebSocket) {
+  const set = roomSockets.get(roomId);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) {
+    roomSockets.delete(roomId);
+  }
+}
+
+function removeClientConnection(ws: WebSocket): ConnectionMeta | undefined {
+  const meta = clientConnections.get(ws);
+  if (meta) {
+    removeSocketFromRoomIndex(meta.roomId, ws);
+    clientConnections.delete(ws);
+  }
+  return meta;
+}
+
+function generateReconnectToken(): string {
+  return `rtoken-${crypto.randomUUID()}`;
+}
+
+// Map (roomId + ':' + playerId) -> secret reconnectToken
+const sessionReconnectTokens = new Map<string, string>();
+
+function registerClientConnection(ws: WebSocket, socketId: string, roomId: string, playerId: string, providedToken?: string): string {
+  const previous = clientConnections.get(ws);
+  if (previous && previous.roomId !== roomId) {
+    removeSocketFromRoomIndex(previous.roomId, ws);
+  }
+
+  const tokenKey = `${roomId}:${playerId}`;
+  let reconnectToken = providedToken || sessionReconnectTokens.get(tokenKey) || generateReconnectToken();
+  sessionReconnectTokens.set(tokenKey, reconnectToken);
+
+  clientConnections.set(ws, {
+    socketId,
+    roomId,
+    playerId,
+    reconnectToken,
+  });
+  addSocketToRoomIndex(roomId, ws);
+  return reconnectToken;
+}
+
+
+// Idempotency window for message processing
+interface MessageCacheItem {
+  result: any;
+  expiresAt: number;
+}
+const processedMessageCache = new Map<string, MessageCacheItem>();
+
+function cleanMessageCache() {
+  const now = Date.now();
+  for (const [id, item] of processedMessageCache.entries()) {
+    if (item.expiresAt < now) {
+      processedMessageCache.delete(id);
+    }
+  }
+}
+setInterval(cleanMessageCache, 30000).unref();
+
+function cacheMessageResult(messageId: string | undefined, resultPayload: any) {
+  if (!messageId) return;
+  processedMessageCache.set(messageId, {
+    result: resultPayload,
+    expiresAt: Date.now() + 60000, // 60s TTL
+  });
+}
+
+function generateRoomId(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let id = '';
+  for (let i = 0; i < 4; i++) {
+    id += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return id;
+}
+
+const BOT_NAMES = ['Bot Luna', 'Bot Thor', 'Bot Maya', 'Bot Max', 'Bot Neo', 'Bot Zoe'];
+const BOT_AVATARS = ['🤖', '🦊', '🐼', '🐯', '🦁', '🦉'];
+
+function broadcastToRoom(roomId: string, message: ServerMessage) {
+  const sockets = roomSockets.get(roomId);
+  if (!sockets || sockets.size === 0) return;
+  const payload = JSON.stringify(message);
+  for (const ws of sockets) {
+    safeWsSend(ws, payload);
+  }
+}
+
+// Reusable multi-table broadcast helper for future tournaments (single or doubles)
+function broadcastToRoomGroup(roomIds: Iterable<string>, message: ServerMessage) {
+  const payload = JSON.stringify(message);
+  for (const roomId of roomIds) {
+    const sockets = roomSockets.get(roomId);
+    if (!sockets) continue;
+    for (const ws of sockets) {
+      safeWsSend(ws, payload);
+    }
+  }
+}
+
+function sendGameStateToPlayer(ws: WebSocket, room: RoomData, playerId: string) {
+  const player = room.players.find((p) => p.id === playerId);
+  const isSpectator = !player && (room.spectators?.some((s) => s.id === playerId) ?? false);
+  if (!player && !isSpectator) return;
+
+  const spectatorCanSeeHands = room.spectatorCardsRevealed ?? (room.settings.spectatorMode === 'reveal_cards');
+  const is2v2 = room.settings.gameMode === 'team_2v2';
+  const teammate = player && is2v2 ? getTeammate(room, player) : undefined;
+
+  const publicPlayers: Player[] = room.players.map((p) => {
+    const isMyTeammate = is2v2 && player && p.team && p.team === player.team && p.id !== player.id;
+    const realPlayer = room.players.find((rp) => rp.id === p.id);
+    return {
+      id: p.id,
+      name: p.name,
+      avatar: p.avatar,
+      isHost: p.isHost,
+      isBot: p.isBot,
+      cardsCount: p.hand.length,
+      hasCalledUno: p.hasCalledUno,
+      isConnected: p.isConnected,
+      score: p.score,
+      team: p.team,
+      teammateHand: isMyTeammate && realPlayer ? realPlayer.hand : undefined,
+      botHand: (room.settings.showBotCards && p.isBot) || (isSpectator && spectatorCanSeeHands) ? p.hand : undefined,
+    };
+  });
+
+  const activePlayer = room.players[room.currentTurnIndex];
+
+  const clientState: GameState = {
+    roomId: room.id,
+    creatorName: room.creatorName,
+    status: room.status,
+    players: publicPlayers,
+    spectators: room.spectators?.map((s) => ({ id: s.id, name: s.name, avatar: s.avatar, isConnected: s.isConnected })),
+    myHand: player ? player.hand : [],
+    discardPileTop: room.discardPile.length > 0 ? room.discardPile[room.discardPile.length - 1] : null,
+    currentColor: room.currentColor,
+    activeColor: room.currentColor === 'wild' ? 'red' : room.currentColor,
+    currentTurnPlayerId: activePlayer ? activePlayer.id : '',
+
+    turnDirection: room.turnDirection,
+    turnTimeLeft: room.turnTimeLeft,
+    turnDuration: room.settings.turnDuration,
+    drawCountPenalty: 0,
+    winnerId: room.winnerId,
+    winnerTeam: room.winnerTeam || null,
+    teammateId: teammate ? teammate.id : null,
+    teammateHand: teammate ? teammate.hand : undefined,
+    unoVulnerablePlayerId: room.unoVulnerablePlayerId,
+    deckCardsCount: room.deck.length,
+    settings: room.settings,
+    gameMode: room.settings.gameMode,
+    isSpectator: isSpectator,
+    spectatorCardsRevealed: spectatorCanSeeHands,
+    stagedCardPlay: room.stagedCardPlay,
+    rematchVotes: room.rematchVotes,
+    roundDurationSeconds: room.lastRoundDurationSeconds,
+    roundTurnCount: room.lastRoundTurnCount,
+    roundPointsWon: room.lastRoundPointsWon,
+    isFastestWin: room.lastRoundIsFastest,
+    tableScores: room.tableScores,
+    tableFastestSeconds: room.fastestRoundSeconds,
+  };
+
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'game_state', state: clientState }));
+
+    if (player) {
+      const topCard = room.discardPile.length > 0 ? room.discardPile[room.discardPile.length - 1] : null;
+      const playableCardIds = topCard
+        ? player.hand.filter((card) => isCardPlayable(card, topCard, room.currentColor)).map((card) => card.id)
+        : player.hand.map((card) => card.id);
+
+      const isMyTurn = activePlayer && activePlayer.id === player.id;
+      const handStatePayload = {
+        type: 'hand_state' as const,
+        hand: player.hand,
+        playableCardIds,
+        canDraw: isMyTurn && !player.hasDrawnThisTurn && room.status === 'playing',
+        canPassTurn: isMyTurn && player.hasDrawnThisTurn && room.status === 'playing',
+      };
+
+      ws.send(JSON.stringify(handStatePayload));
+    }
+  }
+}
+
+
+function syncRoomState(room: RoomData) {
+  const sockets = roomSockets.get(room.id);
+  if (!sockets || sockets.size === 0) return;
+  for (const ws of sockets) {
+    if (ws.readyState === WebSocket.OPEN) {
+      const meta = clientConnections.get(ws);
+      if (meta && meta.roomId === room.id) {
+        sendGameStateToPlayer(ws, room, meta.playerId);
+      }
+    }
+  }
+}
+
+function broadcastLog(room: RoomData, text: string, type: GameLog['type'] = 'action', playerName?: string) {
+  const log: GameLog = {
+    id: Math.random().toString(36).substring(2, 9),
+    timestamp: Date.now(),
+    text,
+    type,
+    playerName,
+  };
+  broadcastToRoom(room.id, { type: 'game_log', log });
+}
+
+function broadcastSound(roomId: string, sound: 'play' | 'draw' | 'uno' | 'reverse' | 'skip' | 'wild' | 'win' | 'penalty') {
+  broadcastToRoom(roomId, { type: 'sound_event', sound });
+}
+
+function broadcastBotChat(room: RoomData, bot: InternalPlayer, text: string) {
+  const chatMsg: ChatMessage = {
+    id: Math.random().toString(36).substring(2, 9),
+    playerId: bot.id,
+    playerName: bot.name,
+    avatar: bot.avatar,
+    text,
+    timestamp: Date.now(),
+  };
+  broadcastToRoom(room.id, { type: 'chat_message', message: chatMsg });
+}
+
+function addBotToRoom(room: RoomData): InternalPlayer | null {
+  if (room.players.length >= room.settings.maxPlayers) return null;
+  const botIdx = room.players.filter((p) => p.isBot).length;
+  const botName = BOT_NAMES[botIdx % BOT_NAMES.length];
+  const botAvatar = BOT_AVATARS[botIdx % BOT_AVATARS.length];
+
+  const botPlayer: InternalPlayer = {
+    id: `bot-${Math.random().toString(36).substring(2, 9)}`,
+    name: botName,
+    avatar: botAvatar,
+    isHost: false,
+    isBot: true,
+    cardsCount: 0,
+    hasCalledUno: false,
+    isConnected: true,
+    score: 0,
+    hand: [],
+    hasDrawnThisTurn: false,
+  };
+
+  room.players.push(botPlayer);
+  return botPlayer;
+}
+
+function startGame(room: RoomData) {
+  if (room.tournamentId) {
+    if (room.players.some((p) => p.isBot)) {
+      throw new Error('Salas de torneio não permitem robôs.');
+    }
+    if (room.players.length < 2) {
+      throw new Error('Sala de torneio exige pelo menos 2 jogadores reais.');
+    }
+    if (room.settings.gameMode === 'team_2v2') {
+      const countA = room.players.filter((p) => p.team === 'A').length;
+      const countB = room.players.filter((p) => p.team === 'B').length;
+      if (room.players.length !== 4 || countA !== 2 || countB !== 2) {
+        throw new Error('Partida de duplas 2v2 do torneio exige 4 jogadores reais (2 na Equipe A e 2 na Equipe B).');
+      }
+      assignTeams2v2(room);
+    }
+  } else if (room.settings.gameMode === 'team_2v2') {
+    // If 2v2 mode em sala normal, ensure 4 players and balance teams with alternating seating
+    while (room.players.length < 4) {
+      addBotToRoom(room);
+    }
+    assignTeams2v2(room);
+  }
+
+  room.deck = createDeck();
+  room.status = 'playing';
+  room.winnerId = null;
+  room.winnerTeam = null;
+  room.unoVulnerablePlayerId = null;
+  room.woRemovedPlayerIds = [];
+  room.pendingWoPlayerIds = [];
+  room.turnDirection = 1;
+  room.currentTurnIndex = Math.floor(Math.random() * room.players.length);
+
+  // Stats tracking for current round
+  room.roundStartTime = Date.now();
+  room.roundTurnCount = 0;
+  if (!room.tableScores) room.tableScores = {};
+  room.players.forEach((p) => {
+    if (!room.tableScores![p.id]) {
+      room.tableScores![p.id] = {
+        playerId: p.id,
+        name: p.name,
+        avatar: p.avatar,
+        wins: 0,
+        points: p.score || 0,
+        roundsPlayed: 0,
+      };
+    }
+    room.tableScores![p.id].name = p.name;
+    room.tableScores![p.id].avatar = p.avatar;
+    room.tableScores![p.id].roundsPlayed += 1;
+  });
+
+  // Deal 7 cards each
+  room.players.forEach((p) => {
+    p.hand = drawCardsFromDeck(room, 7);
+    p.hasCalledUno = false;
+    p.hasDrawnThisTurn = false;
+  });
+
+  // Top initial card: must not be Wild +4
+  let initialCard = drawCardsFromDeck(room, 1)[0];
+  while (initialCard.value === 'wild4') {
+    room.deck.unshift(initialCard);
+    initialCard = drawCardsFromDeck(room, 1)[0];
+  }
+  room.discardPile = [initialCard];
+  room.currentColor = initialCard.color === 'wild' ? 'red' : initialCard.color;
+
+  broadcastLog(
+    room,
+    `🎮 O jogo começou! Carta inicial: ${room.currentColor.toUpperCase()} ${initialCard.value.toUpperCase()}.`,
+    'action'
+  );
+  broadcastSound(room.id, 'play');
+  syncRoomState(room);
+  startTurnTimer(room);
+}
+
+function stopTurnTimer(room: RoomData) {
+  if (room.turnTimerInterval) {
+    clearInterval(room.turnTimerInterval);
+    room.turnTimerInterval = null;
+  }
+  if (room.botTimerTimeout) {
+    clearTimeout(room.botTimerTimeout);
+    room.botTimerTimeout = null;
+  }
+  if (room.stagedCardTimeout) {
+    clearTimeout(room.stagedCardTimeout);
+    room.stagedCardTimeout = null;
+  }
+}
+
+function cleanupRoomResources(room: RoomData) {
+  stopTurnTimer(room);
+  if (room.emptyRoomTimeout) {
+    clearTimeout(room.emptyRoomTimeout);
+    room.emptyRoomTimeout = undefined;
+  }
+  const prefix = `${room.id}:`;
+  for (const key of sessionReconnectTokens.keys()) {
+    if (key.startsWith(prefix)) {
+      sessionReconnectTokens.delete(key);
+    }
+  }
+  const sockets = roomSockets.get(room.id);
+  if (sockets) {
+    for (const clientWs of sockets) {
+      clientConnections.delete(clientWs);
+    }
+    roomSockets.delete(room.id);
+  }
+  for (const [clientWs, meta] of clientConnections.entries()) {
+    if (meta.roomId === room.id) {
+      clientConnections.delete(clientWs);
+    }
+  }
+  rooms.delete(room.id);
+}
+
+function startTurnTimer(room: RoomData) {
+  stopTurnTimer(room);
+  if (room.status !== 'playing') return;
+
+  room.turnTimeLeft = room.settings.turnDuration > 0 ? room.settings.turnDuration : 999;
+  const currentPlayer = room.players[room.currentTurnIndex];
+  if (!currentPlayer) return;
+
+  // If currentPlayer is a Bot, schedule bot action
+  if (currentPlayer.isBot) {
+    scheduleBotTurn(room, currentPlayer);
+  }
+
+  // Only run countdown timer if turnDuration is > 0
+  if (room.settings.turnDuration > 0) {
+    room.turnTimerInterval = setInterval(() => {
+      room.turnTimeLeft -= 1;
+      if (room.turnTimeLeft <= 0) {
+        handleTurnTimeout(room);
+      } else {
+        // Sync clock every 3 seconds to keep UI tidy
+        if (room.turnTimeLeft % 3 === 0) {
+          syncRoomState(room);
+        }
+      }
+    }, 1000);
+  }
+}
+
+function handleTurnTimeout(room: RoomData) {
+  const player = room.players[room.currentTurnIndex];
+  if (!player) return;
+
+  const result = handleTimeoutEngine(room);
+  if (result.drewCard) {
+    broadcastLog(room, `⏱️ Tempo esgotado para ${player.name}! Comprou 1 carta automaticamente.`, 'action', player.name);
+    broadcastSound(room.id, 'draw');
+  } else {
+    broadcastLog(room, `⏱️ Tempo esgotado para ${player.name}! Vez passada automaticamente.`, 'action', player.name);
+  }
+
+  syncRoomState(room);
+  startTurnTimer(room);
+}
+
+function advanceTurn(room: RoomData, steps = 1) {
+  advanceTurnEngine(room, steps);
+  syncRoomState(room);
+  startTurnTimer(room);
+}
+
+function executeTournamentPlayerWO(room: RoomData, playerId: string): TournamentWoRemovalResult {
+  if (
+    room.tournamentId &&
+    (room.settings?.gameMode === 'team_2v2' || room.settings?.tournamentFormat === 'doubles_elimination')
+  ) {
+    return {
+      outcome: 'rejected_2v2_doubles',
+      discardedCardsCount: 0,
+      remainingPlayersCount: room.players.length,
+      wasCurrentTurn: false,
+      cancelledStagedPlay: false,
+    };
+  }
+
+  const res = removeTournamentPlayerWO(room, playerId);
+
+  if (res.cancelledStagedPlay && room.stagedCardTimeout) {
+    clearTimeout(room.stagedCardTimeout);
+    room.stagedCardTimeout = null;
+  }
+
+  if (res.outcome === 'void_insufficient_players') {
+    stopTurnTimer(room);
+    broadcastLog(
+      room,
+      `⚠️ ${res.removedPlayerName || 'Jogador'} recebeu W.O. Partida de torneio anulada por número insuficiente de jogadores (${res.remainingPlayersCount}).`,
+      'system'
+    );
+    syncRoomState(room);
+    const woIds = room.woRemovedPlayerIds || [];
+    handleTournamentGameCompleted(room, {
+      eventId: `void:${room.tournamentGameId || room.id}:${room.id}`,
+      resultReason: 'void_insufficient_players',
+      woEntryIds: woIds,
+    });
+  } else if (res.outcome === 'removed') {
+    stopTurnTimer(room);
+    broadcastLog(
+      room,
+      `🏳️ ${res.removedPlayerName} recebeu W.O. e foi removido da partida (${res.discardedCardsCount} carta(s) movida(s) para o descarte).`,
+      'system'
+    );
+    syncRoomState(room);
+    if (room.status === 'playing') {
+      startTurnTimer(room);
+    }
+  }
+
+  return res;
+}
+
+function executeTournamentDoublesTeamWO(
+  room: RoomData,
+  leavingPlayerId: string
+): { applied: boolean; winnerEntryId?: string; forfeitingEntryId?: string } {
+  if (!room.tournamentId || !room.tournamentGameId) {
+    return { applied: false };
+  }
+  const leavingPlayer = room.players.find((p) => p.id === leavingPlayerId);
+  if (!leavingPlayer || !leavingPlayer.tournamentEntryId) {
+    return { applied: false };
+  }
+
+  const forfeitingEntryId = leavingPlayer.tournamentEntryId;
+  const opposingPlayer = room.players.find(
+    (p) => p.tournamentEntryId && p.tournamentEntryId !== forfeitingEntryId
+  );
+  if (!opposingPlayer || !opposingPlayer.tournamentEntryId) {
+    return { applied: false };
+  }
+
+  const winningEntryId = opposingPlayer.tournamentEntryId;
+  stopTurnTimer(room);
+  room.stagedCardPlay = null;
+  room.status = 'ended';
+  room.winnerId = opposingPlayer.id;
+  room.winnerTeam = opposingPlayer.team || (leavingPlayer.team === 'A' ? 'B' : 'A');
+  room.woRemovedPlayerIds = [forfeitingEntryId];
+  leavingPlayer.isConnected = false;
+
+  broadcastLog(
+    room,
+    `🏳️ W.O. em Duplas 2v2: ${leavingPlayer.name} abandonou a partida. Vitória da equipe adversária (${opposingPlayer.team === 'A' ? 'A' : 'B'})!`,
+    'system'
+  );
+  broadcastSound(room.id, 'win');
+  syncRoomState(room);
+
+  handleTournamentGameCompleted(room, {
+    eventId: `wo_2v2:${room.tournamentGameId}:${room.id}`,
+    winnerEntryId: winningEntryId,
+    resultReason: 'wo',
+    woEntryIds: [forfeitingEntryId],
+  });
+
+  return { applied: true, winnerEntryId: winningEntryId, forfeitingEntryId };
+}
+
+function checkWinCondition(room: RoomData, player: InternalPlayer): boolean {
+  if (player.hand.length === 0) {
+    room.status = 'ended';
+    room.winnerId = player.id;
+    stopTurnTimer(room);
+
+    const is2v2 = room.settings.gameMode === 'team_2v2';
+    const teammate = is2v2 ? getTeammate(room, player) : undefined;
+    if (is2v2) {
+      room.winnerTeam = player.team || 'A';
+    }
+
+    // Calculate score
+    let points = 0;
+    if (is2v2) {
+      points = calculate2v2WinScore(room, player);
+      player.score += points;
+      if (teammate) {
+        teammate.score += points;
+      }
+    } else {
+      room.players.forEach((p) => {
+        if (p.id !== player.id) {
+          points += p.hand.reduce((sum, c) => sum + c.score, 0);
+        }
+      });
+      player.score += points;
+    }
+
+    // Calculate duration & turns
+    const durationSeconds = Math.max(1, Math.round((Date.now() - (room.roundStartTime || Date.now())) / 1000));
+    const turnCount = room.roundTurnCount || 1;
+    const isFastest = !room.fastestRoundSeconds || durationSeconds < room.fastestRoundSeconds;
+    if (isFastest) {
+      room.fastestRoundSeconds = durationSeconds;
+    }
+    if (!room.fewestTurnsRound || turnCount < room.fewestTurnsRound) {
+      room.fewestTurnsRound = turnCount;
+    }
+
+    room.lastRoundDurationSeconds = durationSeconds;
+    room.lastRoundTurnCount = turnCount;
+    room.lastRoundPointsWon = points;
+    room.lastRoundIsFastest = isFastest;
+
+    if (!room.tableScores) room.tableScores = {};
+
+    const updateTableScore = (p: InternalPlayer) => {
+      if (!room.tableScores![p.id]) {
+        room.tableScores![p.id] = {
+          playerId: p.id,
+          name: p.name,
+          avatar: p.avatar,
+          wins: 0,
+          points: 0,
+          roundsPlayed: 1,
+        };
+      }
+      room.tableScores![p.id].wins += 1;
+      room.tableScores![p.id].points += points;
+    };
+
+    updateTableScore(player);
+    if (is2v2 && teammate) {
+      updateTableScore(teammate);
+    }
+
+    let winMsg = is2v2
+      ? `🏆 EQUIPE ${player.team === 'A' ? 'A (AZUL)' : 'B (LARANJA)'} VENCEU A RODADA! ${player.name} zerou suas cartas${teammate ? ` com sua dupla ${teammate.name}` : ''}! (+${points} pontos)`
+      : `🏆 ${player.name} VENCEU A PARTIDA! (+${points} pontos)`;
+
+    if (isFastest) {
+      winMsg += ` ⚡ NOVO RECORDE DA MESA: ${durationSeconds}s!`;
+    }
+    broadcastLog(room, winMsg, 'uno', player.name);
+    broadcastSound(room.id, 'win');
+    syncRoomState(room);
+
+    if (room.tournamentId && room.tournamentGameId && player.tournamentEntryId) {
+      handleTournamentGameCompleted(room, {
+        eventId: `win:${room.tournamentGameId}:${room.id}`,
+        winnerEntryId: player.tournamentEntryId,
+        resultReason: 'normal',
+        woEntryIds: room.woRemovedPlayerIds,
+        roundPointsWon: points,
+      });
+    }
+
+    return true;
+  }
+  return false;
+}
+
+function botSendEmote(room: RoomData, botId: string, emoteId: string, delay = 500) {
+  setTimeout(() => {
+    if (room.status !== 'playing') return;
+    const emote = EMOTES_MAP[emoteId];
+    if (!emote) return;
+    broadcastToRoom(room.id, {
+      type: 'player_emote',
+      emote: {
+        id: `emote-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        playerId: botId,
+        emoteId: emote.id,
+        emoji: emote.emoji,
+        phrase: emote.phrase,
+        soundType: emote.soundType,
+        timestamp: Date.now(),
+      },
+    });
+  }, delay);
+}
+
+function scheduleBotTurn(room: RoomData, bot: InternalPlayer) {
+  // Use configured bot speed (Calm/Infantil 3.0s, Normal 1.8s, Fast 0.8s)
+  const baseSpeed = room.settings.botSpeedMs || 1800;
+  const delay = Math.max(300, baseSpeed * (0.85 + Math.random() * 0.3));
+
+  room.botTimerTimeout = setTimeout(() => {
+    if (room.status !== 'playing') return;
+    if (room.players[room.currentTurnIndex]?.id !== bot.id) return;
+
+    // Check if any opponent is vulnerable to UNO catch (only if autoUnoProtection is false)!
+    if (!room.settings.autoUnoProtection && room.unoVulnerablePlayerId && room.unoVulnerablePlayerId !== bot.id) {
+      const vulnerable = room.players.find((p) => p.id === room.unoVulnerablePlayerId);
+      const isTeammate = room.settings.gameMode === 'team_2v2' && bot.team && vulnerable?.team === bot.team;
+      if (vulnerable && !isTeammate && Math.random() < 0.6) {
+        // 60% chance bot catches player
+        const penalized = drawCardsFromDeck(room, 2);
+        vulnerable.hand.push(...penalized);
+        room.unoVulnerablePlayerId = null;
+        broadcastLog(room, `🚨 ${bot.name} pegou ${vulnerable.name} sem gritar UNO! (+2 cartas)`, 'penalty', bot.name);
+        broadcastSound(room.id, 'penalty');
+        syncRoomState(room);
+      }
+    }
+
+    const topCard = room.discardPile[room.discardPile.length - 1];
+    const playableCards = bot.hand.filter((c) => isCardPlayable(c, topCard, room.currentColor));
+
+    if (playableCards.length > 0) {
+      // Pick best playable card: prefer special cards (+2, skip, reverse) or matching color high value
+      let chosenCard = playableCards.find((c) => c.value === 'draw2' || c.value === 'skip' || c.value === 'reverse');
+      if (!chosenCard) {
+        chosenCard = playableCards.find((c) => c.color === room.currentColor) || playableCards[0];
+      }
+
+      // Pick color if wild
+      let chosenColor: CardColor | undefined;
+      if (chosenCard.color === 'wild') {
+        const colorCounts: Record<CardColor, number> = { red: 0, blue: 0, green: 0, yellow: 0, wild: 0 };
+        bot.hand.forEach((c) => {
+          if (c.color !== 'wild') colorCounts[c.color]++;
+        });
+        const highestColor = (['red', 'blue', 'green', 'yellow'] as CardColor[]).reduce((a, b) =>
+          colorCounts[a] >= colorCounts[b] ? a : b
+        );
+        chosenColor = highestColor;
+      }
+
+      // Bot calls UNO when down to 1
+      if (bot.hand.length === 2) {
+        bot.hasCalledUno = true;
+        broadcastLog(room, `🔊 ${bot.name}: "UNO!"`, 'uno', bot.name);
+        broadcastSound(room.id, 'uno');
+        if (Math.random() < 0.65) {
+          botSendEmote(room, bot.id, 'ahaa', 300);
+        }
+      }
+
+      executePlayCard(room, bot, chosenCard.id, chosenColor);
+    } else {
+      // Draw card
+      const drawn = drawCardsFromDeck(room, 1);
+      bot.hand.push(...drawn);
+      broadcastLog(room, `${bot.name} comprou 1 carta.`, 'action', bot.name);
+      broadcastSound(room.id, 'draw');
+
+      if (Math.random() < 0.3) {
+        botSendEmote(room, bot.id, 'cry', 500);
+      }
+
+      // Check if newly drawn card is playable
+      const newCard = drawn[0];
+      if (newCard && isCardPlayable(newCard, topCard, room.currentColor)) {
+        setTimeout(() => {
+          if (room.status !== 'playing') return;
+          let chosenColor: CardColor | undefined;
+          if (newCard.color === 'wild') chosenColor = 'blue';
+          executePlayCard(room, bot, newCard.id, chosenColor);
+        }, 800);
+      } else {
+        advanceTurn(room, 1);
+      }
+    }
+  }, delay);
+}
+
+function finalizePlayCard(
+  room: RoomData,
+  player: InternalPlayer,
+  cardId: string,
+  chosenColor?: CardColor
+) {
+  if (room.status !== 'playing') return;
+  if (!room.players.some((p) => p.id === player.id)) return;
+  if (room.players[room.currentTurnIndex]?.id !== player.id) return;
+
+  const cardIndex = player.hand.findIndex((c) => c.id === cardId);
+  if (cardIndex === -1) return;
+
+  const card = player.hand[cardIndex];
+
+  // Remove card from player hand
+  player.hand.splice(cardIndex, 1);
+  room.discardPile.push(card);
+
+  // If player has 1 card left and didn't call UNO
+  if (player.hand.length === 1 && !player.hasCalledUno) {
+    if (room.settings.autoUnoProtection) {
+      player.hasCalledUno = true;
+      broadcastLog(room, `🛡️ ${player.name} ativou o UNO automaticamente (Proteção Infantil)!`, 'uno', player.name);
+      broadcastSound(room.id, 'uno');
+    } else {
+      room.unoVulnerablePlayerId = player.id;
+      room.unoVulnerableTurnCount = room.roundTurnCount;
+    }
+  } else if (player.hand.length !== 1) {
+    player.hasCalledUno = false;
+    if (room.unoVulnerablePlayerId === player.id) {
+      room.unoVulnerablePlayerId = null;
+      delete room.unoVulnerableTurnCount;
+    }
+  }
+
+  // Handle card colors
+  if (card.color === 'wild') {
+    room.currentColor = chosenColor || 'red';
+  } else {
+    room.currentColor = card.color;
+  }
+
+  // Card effects
+  let steps = 1;
+  let logText = `${player.name} jogou ${card.color.toUpperCase()} ${card.value.toUpperCase()}.`;
+  let soundToPlay: 'play' | 'reverse' | 'skip' | 'wild' = 'play';
+
+  if (card.value === 'reverse') {
+    if (room.players.length === 2) {
+      steps = 2; // acts as skip in 2 players
+      logText = `${player.name} jogou Reverso! Joga novamente.`;
+    } else {
+      room.turnDirection = (room.turnDirection * -1) as -1 | 1;
+      logText = `${player.name} inverteu o sentido do jogo!`;
+    }
+    soundToPlay = 'reverse';
+  } else if (card.value === 'skip') {
+    steps = 2;
+    const skippedIdx = getNextPlayerIndex(room.currentTurnIndex, room.turnDirection, room.players.length, 1);
+    const skippedPlayer = room.players[skippedIdx];
+    logText = `${player.name} pulou a vez de ${skippedPlayer.name}!`;
+    soundToPlay = 'skip';
+  } else if (card.value === 'draw2') {
+    steps = 2;
+    const targetIdx = getNextPlayerIndex(room.currentTurnIndex, room.turnDirection, room.players.length, 1);
+    const targetPlayer = room.players[targetIdx];
+    const penaltyCards = drawCardsFromDeck(room, 2);
+    targetPlayer.hand.push(...penaltyCards);
+    targetPlayer.cardsCount = targetPlayer.hand.length;
+    expireUnoVulnerability(room);
+    logText = `${player.name} jogou +2! ${targetPlayer.name} comprou 2 cartas e perdeu a vez.`;
+    broadcastSound(room.id, 'draw');
+
+    // Bot emotes
+    if (player.isBot && Math.random() < 0.6) {
+      botSendEmote(room, player.id, Math.random() < 0.5 ? 'joga_pouco' : 'laugh', 400);
+    }
+    if (targetPlayer.isBot && Math.random() < 0.65) {
+      botSendEmote(room, targetPlayer.id, Math.random() < 0.5 ? 'cry' : 'e_agora', 700);
+    }
+  } else if (card.value === 'wild4') {
+    steps = 2;
+    const targetIdx = getNextPlayerIndex(room.currentTurnIndex, room.turnDirection, room.players.length, 1);
+    const targetPlayer = room.players[targetIdx];
+    const penaltyCards = drawCardsFromDeck(room, 4);
+    targetPlayer.hand.push(...penaltyCards);
+    targetPlayer.cardsCount = targetPlayer.hand.length;
+    expireUnoVulnerability(room);
+    logText = `${player.name} jogou CORINGA +4! Nova cor: ${room.currentColor.toUpperCase()}. ${targetPlayer.name} comprou 4 cartas e perdeu a vez!`;
+    soundToPlay = 'wild';
+    broadcastSound(room.id, 'draw');
+
+    // Bot emotes
+    if (player.isBot && Math.random() < 0.75) {
+      botSendEmote(room, player.id, Math.random() < 0.5 ? 'joga_pouco' : 'laugh', 400);
+    }
+    if (targetPlayer.isBot && Math.random() < 0.75) {
+      botSendEmote(room, targetPlayer.id, Math.random() < 0.5 ? 'cry' : 'e_agora', 700);
+    }
+  } else if (card.value === 'wild') {
+    logText = `${player.name} jogou CORINGA! Mudou a cor para ${room.currentColor.toUpperCase()}.`;
+    soundToPlay = 'wild';
+  }
+
+  broadcastLog(room, logText, 'action', player.name);
+  broadcastSound(room.id, soundToPlay);
+
+  if (checkWinCondition(room, player)) {
+    room.pendingWoPlayerIds = [];
+    return;
+  }
+
+  if (room.tournamentId && room.pendingWoPlayerIds && room.pendingWoPlayerIds.length > 0) {
+    advanceTurnEngine(room, steps);
+    const flushed = flushPendingTournamentWOs(room);
+    let voided = false;
+    for (const woRes of flushed) {
+      if (woRes.outcome === 'void_insufficient_players') {
+        voided = true;
+        stopTurnTimer(room);
+        broadcastLog(
+          room,
+          `⚠️ ${woRes.removedPlayerName || 'Jogador'} recebeu W.O. Partida de torneio anulada por número insuficiente de jogadores (${woRes.remainingPlayersCount}).`,
+          'system'
+        );
+        break;
+      } else if (woRes.outcome === 'removed') {
+        broadcastLog(
+          room,
+          `🏳️ ${woRes.removedPlayerName} recebeu W.O. e foi removido da partida (${woRes.discardedCardsCount} carta(s) movida(s) para o descarte).`,
+          'system'
+        );
+      }
+    }
+    syncRoomState(room);
+    if (!voided && room.status === 'playing') {
+      startTurnTimer(room);
+    }
+    return;
+  }
+
+  advanceTurn(room, steps);
+}
+
+function executePlayCard(
+  room: RoomData,
+  player: InternalPlayer,
+  cardId: string,
+  chosenColor?: CardColor,
+  ws?: WebSocket
+) {
+  const cardIndex = player.hand.findIndex((c) => c.id === cardId);
+  if (cardIndex === -1) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Carta não encontrada na sua mão.' }));
+    }
+    return;
+  }
+
+  const card = player.hand[cardIndex];
+  const topCard = room.discardPile[room.discardPile.length - 1];
+
+  if (!isCardPlayable(card, topCard, room.currentColor)) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'error',
+          message: `Esta carta não pode ser jogada agora! A cor atual é ${room.currentColor.toUpperCase()} ou valor ${topCard.value.toUpperCase()}.`,
+        })
+      );
+    }
+    return;
+  }
+
+  // Animation staging: if playAnimationDelay is configured (or default 1.5s)
+  const animDelaySeconds = room.settings.playAnimationDelay !== undefined ? room.settings.playAnimationDelay : 1.5;
+
+  if (animDelaySeconds > 0) {
+    if (room.stagedCardTimeout) {
+      clearTimeout(room.stagedCardTimeout);
+      room.stagedCardTimeout = null;
+    }
+
+    room.stagedCardPlay = {
+      card,
+      playerId: player.id,
+      playerName: player.name,
+      playerAvatar: player.avatar,
+      chosenColor,
+      timestamp: Date.now(),
+      delaySeconds: animDelaySeconds,
+    };
+
+    syncRoomState(room);
+
+    room.stagedCardTimeout = setTimeout(() => {
+      room.stagedCardTimeout = null;
+      room.stagedCardPlay = null;
+      finalizePlayCard(room, player, cardId, chosenColor);
+    }, animDelaySeconds * 1000);
+  } else {
+    finalizePlayCard(room, player, cardId, chosenColor);
+  }
+}
+
+// WebSocket setup (perMessageDeflate: false avoids ~300KB zlib arena/socket; maxPayload protects RAM)
+const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  perMessageDeflate: false,
+  maxPayload: 256 * 1024,
+});
+
+// Protocol Ping/Pong Heartbeat (30s) to evict zombie/half-open connections cleanly
+const WS_HEARTBEAT_INTERVAL_MS = 30000;
+const aliveSockets = new WeakSet<WebSocket>();
+const wsHeartbeatTimer = setInterval(() => {
+  for (const client of wss.clients) {
+    if (!aliveSockets.has(client)) {
+      try {
+        client.terminate();
+      } catch {}
+      continue;
+    }
+    aliveSockets.delete(client);
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.ping();
+      } catch {}
+    }
+  }
+}, WS_HEARTBEAT_INTERVAL_MS);
+wsHeartbeatTimer.unref();
+
+interface OnlinePlayerSession {
+  id: string;
+  name: string;
+  avatar: string;
+  inRoom: boolean;
+  userId?: string;
+  authenticatedUserId?: string;
+  authenticatedRole?: string;
+  roomId: string | null;
+  connectedAt?: number;
+  ip?: string;
+  userAgent?: string;
+  socketId?: string;
+  role?: string;
+  tag?: string;
+  createdAt?: string;
+  tournamentId?: string;
+  tournamentTeamId?: string;
+}
+
+const onlinePlayers = new Map<WebSocket, OnlinePlayerSession>();
+const lobbyChatRateLimits = new Map<WebSocket, number[]>();
+const startSoloRateLimits = new Map<WebSocket, number>();
+
+interface RoomInvite {
+  inviteId: string;
+  roomId: string;
+  roomName: string;
+  inviterUserId: string;
+  inviterName: string;
+  inviterAvatar: string;
+  targetUserId: string;
+  status: 'pending' | 'accepted' | 'declined' | 'expired';
+  createdAt: number;
+  expiresAt: number;
+}
+const roomInvites = new Map<string, RoomInvite>();
+const inviteRateLimits = new Map<string, number[]>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, inv] of roomInvites.entries()) {
+    if (inv.expiresAt < now || inv.status === 'expired') {
+      roomInvites.delete(id);
+    }
+  }
+}, 60000).unref();
+
+function checkInviteRateLimit(userId: string): boolean {
+  const now = Date.now();
+  const times = inviteRateLimits.get(userId) || [];
+  const recent = times.filter(t => now - t < 60000);
+  if (recent.length >= 10) return false;
+  recent.push(now);
+  inviteRateLimits.set(userId, recent);
+  return true;
+}
+
+const ONLINE_BROADCAST_BATCH_MS = 100;
+const DEFAULT_ONLINE_PAGE_SIZE = 50;
+const MAX_ONLINE_PAGE_SIZE = 100;
+const MAX_LOBBY_BACKPRESSURE_BYTES = 256 * 1024;
+
+interface OnlinePagePref {
+  page: number;
+  pageSize: number;
+  filter: OnlinePlayersFilter;
+}
+
+const clientOnlinePagePrefs = new WeakMap<WebSocket, OnlinePagePref>();
+let onlineBroadcastTimer: NodeJS.Timeout | null = null;
+
+function buildAllOnlinePlayersList(): OnlinePlayerSummary[] {
+  const list: OnlinePlayerSummary[] = [];
+  for (const p of onlinePlayers.values()) {
+    list.push({
+      id: p.id,
+      name: p.name,
+      avatar: p.avatar,
+      inRoom: p.inRoom,
+      roomId: p.roomId,
+      userId: p.userId,
+      connectedAt: p.connectedAt,
+      tag: p.tag,
+      role: p.role,
+      tournamentId: p.tournamentId,
+      tournamentTeamId: p.tournamentTeamId,
+    });
+  }
+  return list;
+}
+
+function buildPaginatedOnlinePayloadJson(
+  allPlayers: OnlinePlayerSummary[],
+  pref: OnlinePagePref,
+  cache?: Map<string, string>
+): string {
+  const safePageSize = Math.max(10, Math.min(MAX_ONLINE_PAGE_SIZE, pref.pageSize || DEFAULT_ONLINE_PAGE_SIZE));
+  const filter = pref.filter || 'all';
+
+  let filtered = allPlayers;
+  if (filter === 'lobby_only') {
+    filtered = allPlayers.filter((p) => !p.inRoom);
+  } else if (filter === 'in_room') {
+    filtered = allPlayers.filter((p) => !!p.inRoom);
+  }
+
+  const totalCount = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / safePageSize));
+  const safePage = Math.max(1, Math.min(pref.page || 1, totalPages));
+  const cacheKey = `${filter}:${safePage}:${safePageSize}`;
+
+  if (cache) {
+    const hit = cache.get(cacheKey);
+    if (hit) return hit;
+  }
+
+  const start = (safePage - 1) * safePageSize;
+  const pagePlayers = filtered.slice(start, start + safePageSize);
+  const encoded = JSON.stringify({
+    type: 'lobby_online_players',
+    players: pagePlayers,
+    totalCount,
+    page: safePage,
+    pageSize: safePageSize,
+    totalPages,
+    filter,
+  });
+
+  if (cache) {
+    cache.set(cacheKey, encoded);
+  }
+  return encoded;
+}
+
+function shouldReceiveLobbyOnlineBroadcast(ws: WebSocket): boolean {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  if (ws.bufferedAmount > MAX_LOBBY_BACKPRESSURE_BYTES) return false;
+  const conn = clientConnections.get(ws);
+  if (!conn) return true; // No lobby
+  const room = rooms.get(conn.roomId);
+  // Hosts/jogadores em sala de espera (waiting) ainda veem o painel do Lobby para convidar amigos;
+  // jogadores/espectadores com partida ativa (playing/paused) ou encerrada não precisam de updates globais do lobby.
+  return !room || room.status === 'waiting';
+}
+
+function sendOnlinePlayersToSocket(ws: WebSocket, allPlayers?: OnlinePlayerSummary[]) {
+  if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > MAX_LOBBY_BACKPRESSURE_BYTES) return;
+  const list = allPlayers || buildAllOnlinePlayersList();
+  const pref = clientOnlinePagePrefs.get(ws) || {
+    page: 1,
+    pageSize: DEFAULT_ONLINE_PAGE_SIZE,
+    filter: 'all' as OnlinePlayersFilter,
+  };
+  const payload = buildPaginatedOnlinePayloadJson(list, pref);
+  safeWsSend(ws, payload, MAX_LOBBY_BACKPRESSURE_BYTES);
+}
+
+function flushOnlinePlayersBroadcast() {
+  onlineBroadcastTimer = null;
+  if (onlinePlayers.size === 0) return;
+
+  const allPlayers = buildAllOnlinePlayersList();
+  const payloadCache = new Map<string, string>();
+  const defaultPref: OnlinePagePref = {
+    page: 1,
+    pageSize: DEFAULT_ONLINE_PAGE_SIZE,
+    filter: 'all',
+  };
+
+  for (const ws of onlinePlayers.keys()) {
+    if (!shouldReceiveLobbyOnlineBroadcast(ws)) continue;
+    const pref = clientOnlinePagePrefs.get(ws) || defaultPref;
+    const payload = buildPaginatedOnlinePayloadJson(allPlayers, pref, payloadCache);
+    safeWsSend(ws, payload, MAX_LOBBY_BACKPRESSURE_BYTES);
+  }
+}
+
+function scheduleBroadcastOnlinePlayers() {
+  if (onlineBroadcastTimer) return;
+  onlineBroadcastTimer = setTimeout(flushOnlinePlayersBroadcast, ONLINE_BROADCAST_BATCH_MS);
+  onlineBroadcastTimer.unref();
+}
+
+function broadcastOnlinePlayers() {
+  scheduleBroadcastOnlinePlayers();
+}
+
+function updatePlayerRoom(ws: WebSocket, roomId: string | null) {
+  const meta = onlinePlayers.get(ws);
+  if (meta) {
+    meta.roomId = roomId;
+    meta.inRoom = roomId !== null;
+    scheduleBroadcastOnlinePlayers();
+  }
+}
+
+wss.on('connection', (ws: WebSocket, req: any) => {
+  aliveSockets.add(ws);
+  ws.on('pong', () => {
+    aliveSockets.add(ws);
+  });
+
+  const socketId = `soc-${crypto.randomUUID()}`;
+  const rawIp = (req?.headers?.['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req?.socket?.remoteAddress || '127.0.0.1';
+  const cleanIp = rawIp.replace(/^::ffff:/, '');
+  const userAgent = (req?.headers?.['user-agent'] as string) || '';
+  const connectedAt = Date.now();
+
+  // Permite autenticação JWT opcional já no handshake WS (?token= ou Authorization Bearer)
+  try {
+    const authHeader = typeof req?.headers?.authorization === 'string' ? req.headers.authorization : '';
+    const rawUrl = typeof req?.url === 'string' ? req.url : '';
+    const urlObj = rawUrl ? new URL(rawUrl, 'http://localhost') : null;
+    const handshakeToken = authHeader.startsWith('Bearer ')
+      ? authHeader.split(' ')[1]
+      : urlObj?.searchParams.get('token') || undefined;
+    if (handshakeToken) {
+      const decodedHandshake = verifyToken(handshakeToken);
+      if (decodedHandshake) {
+        const rec = getUserRecordById(decodedHandshake.id);
+        if (rec && !isUserAccountActive(rec)) {
+          try {
+            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Esta conta foi desativada ou arquivada pelo administrador.' }));
+            ws.close(4003, 'Conta desativada ou arquivada.');
+          } catch {}
+          return;
+        }
+      }
+      const verified = getUserFromToken(handshakeToken);
+      if (verified) {
+        onlinePlayers.set(ws, {
+          id: `user-${verified.username}`,
+          name: verified.displayName || verified.username,
+          avatar: verified.avatar || '👤',
+          inRoom: false,
+          userId: verified.username,
+          authenticatedUserId: verified.id,
+          authenticatedRole: verified.role,
+          roomId: null,
+          connectedAt,
+          ip: cleanIp,
+          userAgent,
+          socketId,
+          role: verified.role,
+          tag: verified.tag,
+          createdAt: verified.createdAt,
+        });
+      }
+    }
+  } catch {}
+
+  ws.on('message', (data: string) => {
+    try {
+      const msg: ClientMessage = JSON.parse(data.toString());
+
+      // 1. Protocol Version Check
+      if (msg.protocolVersion !== undefined && typeof msg.protocolVersion === 'number' && msg.protocolVersion < 1) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: 'action_rejected',
+              messageId: msg.messageId,
+              code: 'UNSUPPORTED_VERSION',
+              message: 'Unsupported protocol version.',
+            })
+          );
+        }
+        return;
+      }
+
+      // 2. Idempotency Check (if messageId is provided and already processed)
+      if (msg.messageId && processedMessageCache.has(msg.messageId)) {
+        const cached = processedMessageCache.get(msg.messageId);
+        if (cached && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(cached.result));
+        }
+        return;
+      }
+
+      // 3. Socket Identity Verification (PLAYER_MISMATCH)
+      const socketMeta = clientConnections.get(ws);
+      const msgPlayerId = (msg as any).playerId;
+      if (socketMeta && socketMeta.playerId && msgPlayerId && typeof msgPlayerId === 'string' && msgPlayerId !== socketMeta.playerId) {
+        if (ws.readyState === WebSocket.OPEN) {
+          const rejectMsg = {
+            type: 'action_rejected',
+            messageId: msg.messageId,
+            code: 'PLAYER_MISMATCH' as const,
+            message: 'Identity mismatch: cannot send actions on behalf of another player.',
+          };
+          ws.send(JSON.stringify(rejectMsg));
+          cacheMessageResult(msg.messageId, rejectMsg);
+        }
+        return;
+      }
+
+      if (msg.type === 'register_lobby') {
+        let verifiedJwtUser: ReturnType<typeof getUserFromToken> | null = null;
+        if (msg.token) {
+          const decodedToken = verifyToken(msg.token);
+          if (decodedToken) {
+            const rawRec = getUserRecordById(decodedToken.id);
+            if (rawRec && !isUserAccountActive(rawRec)) {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
+                ws.close(4003, 'Conta desativada ou arquivada.');
+              }
+              return;
+            }
+          }
+          verifiedJwtUser = getUserFromToken(msg.token);
+        }
+        let authUser = verifiedJwtUser;
+        if (!authUser && msg.playerId && msg.playerId.startsWith('usr_')) {
+          const found = getAllUsers().find(u => u.id === msg.playerId) || null;
+          if (found && !isUserAccountActive(found)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
+              ws.close(4003, 'Conta desativada ou arquivada.');
+            }
+            return;
+          }
+          authUser = found;
+        } else if (!authUser && msg.name && msg.name !== 'Visitante' && msg.name !== '🕵️') {
+          const found = getAllUsers().find(u => u.displayName.toLowerCase() === msg.name.toLowerCase() || u.username.toLowerCase() === msg.name.toLowerCase()) || null;
+          if (found && !isUserAccountActive(found)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
+              ws.close(4003, 'Conta desativada ou arquivada.');
+            }
+            return;
+          }
+          authUser = found;
+        }
+
+        const pId = authUser ? `user-${authUser.username}` : (msg.playerId || `player-${crypto.randomUUID()}`);
+        const name = authUser ? (authUser.displayName || authUser.username) : (msg.name && msg.name !== 'Visitante' ? msg.name : 'Visitante');
+        const avatar = authUser ? (authUser.avatar || '👤') : (msg.avatar && msg.avatar !== '🕵️' ? msg.avatar : '🕵️');
+
+        const existing = onlinePlayers.get(ws);
+        onlinePlayers.set(ws, {
+          id: pId,
+          name,
+          avatar,
+          inRoom: false,
+          userId: authUser ? authUser.username : (msg.name && msg.name !== 'Visitante' ? msg.name.toLowerCase().replace(/\s+/g, '') : undefined),
+          authenticatedUserId: verifiedJwtUser ? verifiedJwtUser.id : existing?.authenticatedUserId,
+          authenticatedRole: verifiedJwtUser ? verifiedJwtUser.role : existing?.authenticatedRole,
+          roomId: null,
+          connectedAt: existing?.connectedAt || connectedAt,
+          ip: cleanIp,
+          userAgent,
+          socketId,
+          role: authUser ? authUser.role : (msg.name && msg.name !== 'Visitante' ? 'player' : 'visitor'),
+          tag: authUser?.tag,
+          createdAt: authUser?.createdAt
+        });
+        sendOnlinePlayersToSocket(ws);
+        scheduleBroadcastOnlinePlayers();
+        return;
+      }
+
+      if (msg.type === 'get_online_players_page') {
+        const reqPage = Number((msg as any).page) || 1;
+        const reqPageSize = Number((msg as any).pageSize) || DEFAULT_ONLINE_PAGE_SIZE;
+        const reqFilter: OnlinePlayersFilter =
+          (msg as any).filter === 'lobby_only' || (msg as any).filter === 'in_room'
+            ? (msg as any).filter
+            : 'all';
+        clientOnlinePagePrefs.set(ws, {
+          page: Math.max(1, reqPage),
+          pageSize: Math.max(10, Math.min(MAX_ONLINE_PAGE_SIZE, reqPageSize)),
+          filter: reqFilter,
+        });
+        sendOnlinePlayersToSocket(ws);
+        return;
+      }
+
+      if (msg.type === 'send_lobby_chat') {
+        const meta = onlinePlayers.get(ws);
+        if (!meta || !meta.userId) {
+          // Visitors cannot write in global chat (read-only)
+          return;
+        }
+
+        const text = (msg.text || '').trim().substring(0, 200);
+        if (!text) return;
+
+        const now = Date.now();
+        const times = lobbyChatRateLimits.get(ws) || [];
+        const recent = times.filter(t => now - t < 10000);
+        if (recent.length >= 5) {
+          if (ws.readyState === WebSocket.OPEN) {
+            safeWsSend(ws, JSON.stringify({ type: 'error', message: 'Muitas mensagens enviadas. Aguarde um instante.' }));
+          }
+          return;
+        }
+        recent.push(now);
+        lobbyChatRateLimits.set(ws, recent);
+
+        const payload = JSON.stringify({
+          type: 'lobby_chat_message',
+          message: {
+            id: `msg-${crypto.randomUUID()}`,
+            name: meta.name,
+            avatar: meta.avatar,
+            text,
+            timestamp: Date.now()
+          }
+        });
+        onlinePlayers.forEach((_clientMeta, clientWs) => {
+          safeWsSend(clientWs, payload, MAX_LOBBY_BACKPRESSURE_BYTES);
+        });
+        return;
+      }
+
+      if (msg.type === 'send_room_invite') {
+        const senderMeta = onlinePlayers.get(ws);
+        if (!senderMeta || !senderMeta.userId) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Você precisa estar logado para enviar convites.' }));
+          }
+          return;
+        }
+        if (!checkInviteRateLimit(senderMeta.userId)) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Limite de convites excedido. Aguarde um minuto.' }));
+          }
+          return;
+        }
+
+        const room = rooms.get((msg.roomId || '').trim().toUpperCase());
+        if (!room) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Sala não encontrada.' }));
+          }
+          return;
+        }
+
+        if (room.ownerUserId !== senderMeta.userId) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Apenas o dono da sala pode enviar convites.' }));
+          }
+          return;
+        }
+
+        const targetUserId = msg.targetUserId;
+        if (targetUserId === senderMeta.userId) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Você não pode convidar a si mesmo.' }));
+          }
+          return;
+        }
+
+        const alreadyInRoom = room.players.some(p => !p.isBot && p.isConnected && p.name.toLowerCase().includes(targetUserId.toLowerCase()));
+        if (alreadyInRoom) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Este jogador já está na sala.' }));
+          }
+          return;
+        }
+
+        let targetWs: WebSocket | null = null;
+        let targetMeta: { id: string; name: string; avatar: string; userId?: string } | null = null;
+        for (const [clientWs, meta] of onlinePlayers.entries()) {
+          if (meta.userId === targetUserId) {
+            targetWs = clientWs;
+            targetMeta = meta;
+            break;
+          }
+        }
+
+        if (!targetWs || !targetMeta) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Jogador não encontrado ou offline.' }));
+          }
+          return;
+        }
+
+        const inviteId = crypto.randomUUID();
+        const invite: RoomInvite = {
+          inviteId,
+          roomId: room.id,
+          roomName: `Sala de ${senderMeta.name}`,
+          inviterUserId: senderMeta.userId,
+          inviterName: senderMeta.name,
+          inviterAvatar: senderMeta.avatar,
+          targetUserId,
+          status: 'pending',
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 300000
+        };
+
+        roomInvites.set(inviteId, invite);
+
+        if (targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(JSON.stringify({ type: 'room_invite_received', invite }));
+        }
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'success', message: `Convite enviado para ${targetMeta.name}!` }));
+        }
+        return;
+      }
+
+      if (msg.type === 'respond_room_invite') {
+        const responderMeta = onlinePlayers.get(ws);
+        if (!responderMeta || !responderMeta.userId) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Não autenticado.' }));
+          }
+          return;
+        }
+
+        const invite = roomInvites.get(msg.inviteId);
+        if (!invite || invite.targetUserId !== responderMeta.userId || invite.status !== 'pending') {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Convite inválido ou expirado.' }));
+          }
+          return;
+        }
+
+        if (invite.expiresAt < Date.now()) {
+          invite.status = 'expired';
+          roomInvites.delete(invite.inviteId);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Este convite expirou.' }));
+          }
+          return;
+        }
+
+        invite.status = msg.accept ? 'accepted' : 'declined';
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'room_invite_response', inviteId: invite.inviteId, accepted: msg.accept }));
+        }
+        return;
+      }
+
+      if (msg.type === 'start_solo') {
+        const onlineMeta = onlinePlayers.get(ws);
+        if (onlineMeta?.authenticatedUserId) {
+          const rec = getUserRecordById(onlineMeta.authenticatedUserId);
+          if (rec && !isUserAccountActive(rec)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
+              ws.close(4003, 'Conta desativada ou arquivada.');
+            }
+            return;
+          }
+        }
+        const lastSolo = startSoloRateLimits.get(ws) || 0;
+        if (Date.now() - lastSolo < 2000) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Aguarde um instante para iniciar outra partida.' }));
+          }
+          return;
+        }
+        startSoloRateLimits.set(ws, Date.now());
+
+        const roomId = generateRoomId();
+        const hostPlayer: InternalPlayer = {
+          id: `player-${Math.random().toString(36).substring(2, 9)}`,
+          name: msg.playerName.trim() || 'Jogador',
+          avatar: msg.avatar || '🦸‍♂️',
+          isHost: true,
+          isBot: false,
+          cardsCount: 0,
+          hasCalledUno: false,
+          isConnected: true,
+          score: 0,
+          hand: [],
+          hasDrawnThisTurn: false,
+        };
+
+        const is2v2 = msg.settings?.gameMode === 'team_2v2';
+        if (is2v2) {
+          hostPlayer.team = 'A';
+        }
+
+        const count = is2v2 ? 3 : Math.max(1, Math.min(3, msg.botCount || 1));
+        const duration = msg.settings?.turnDuration !== undefined ? msg.settings.turnDuration : 25;
+        const room: RoomData = {
+          id: roomId,
+          settings: {
+            maxPlayers: is2v2 ? 4 : count + 1,
+            gameMode: is2v2 ? 'team_2v2' : 'standard',
+            turnDuration: duration,
+            challengeUnoRule: msg.settings?.challengeUnoRule ?? true,
+            showBotCards: msg.settings?.showBotCards !== undefined ? msg.settings.showBotCards : true,
+            botSpeedMs: msg.settings?.botSpeedMs ?? 1800,
+            autoUnoProtection: msg.settings?.autoUnoProtection ?? false,
+            highlightHints: msg.settings?.highlightHints ?? true,
+          },
+          status: 'waiting',
+          players: [hostPlayer],
+          deck: [],
+          discardPile: [],
+          currentColor: 'red',
+          currentTurnIndex: 0,
+          turnDirection: 1,
+          turnTimeLeft: duration > 0 ? duration : 999,
+          winnerId: null,
+          winnerTeam: null,
+          unoVulnerablePlayerId: null,
+          turnTimerInterval: null,
+          botTimerTimeout: null,
+        };
+
+        // Add the selected number of bots
+        for (let i = 0; i < count; i++) {
+          const newBot = addBotToRoom(room);
+          if (newBot && is2v2) {
+            // First bot is on Team A (teammate), other 2 are on Team B (opponents)
+            newBot.team = i === 0 ? 'A' : 'B';
+          }
+        }
+
+        rooms.set(roomId, room);
+        const reconnectToken = registerClientConnection(ws, socketId, roomId, hostPlayer.id);
+        updatePlayerRoom(ws, roomId);
+
+        ws.send(JSON.stringify({ type: 'room_joined', roomId, playerId: hostPlayer.id, reconnectToken }));
+        startGame(room);
+        return;
+      }
+
+      if (msg.type === 'leave_room') {
+        const cleanRoomId = (msg.roomId || '').replace(/[^A-Za-z0-9]/g, '').trim().toUpperCase();
+
+        // 1. Remove this connection and any other socket registered to this player in this room
+        removeClientConnection(ws);
+        const roomSocketSet = roomSockets.get(cleanRoomId);
+        if (roomSocketSet) {
+          for (const clientWs of Array.from(roomSocketSet)) {
+            const meta = clientConnections.get(clientWs);
+            if (meta && meta.playerId === msg.playerId && meta.roomId === cleanRoomId) {
+              removeClientConnection(clientWs);
+            }
+          }
+        }
+
+        // 2. Send acknowledgment to the client
+        try {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'left_room_confirmed', roomId: cleanRoomId }));
+          }
+        } catch (e) {}
+        updatePlayerRoom(ws, null);
+
+        const room = rooms.get(cleanRoomId);
+        if (room) {
+          // Check if leaving is a spectator
+          const specIdx = room.spectators ? room.spectators.findIndex((s) => s.id === msg.playerId) : -1;
+          if (specIdx !== -1) {
+            const leavingSpec = room.spectators![specIdx];
+            room.spectators!.splice(specIdx, 1);
+            broadcastLog(room, `📺 ${leavingSpec.name} saiu da transmissão.`, 'system');
+            const hasOnlineHumans = room.players.some((p) => !p.isBot && p.isConnected) || (room.spectators && room.spectators.length > 0);
+            if (!hasOnlineHumans && !room.tournamentId) {
+              cleanupRoomResources(room);
+            } else {
+              syncRoomState(room);
+            }
+            return;
+          }
+
+          const idx = room.players.findIndex((p) => p.id === msg.playerId);
+          if (idx !== -1) {
+            const leaving = room.players[idx];
+            const originalName = leaving.name;
+
+            // Voice leave
+            broadcastToRoom(room.id, {
+              type: 'rtc_voice_state',
+              roomId: room.id,
+              playerId: leaving.id,
+              isMuted: true,
+              isDeafened: true,
+              isSpeaking: false,
+              joined: false,
+            });
+
+            if (leaving.isHost) {
+              leaving.isHost = false;
+              const nextHost = room.players.find((p) => !p.isBot && p.isConnected && p.id !== leaving.id);
+              if (nextHost) {
+                nextHost.isHost = true;
+                broadcastLog(room, `👑 ${nextHost.name} agora é o novo Anfitrião da sala!`, 'system');
+              }
+            }
+
+            if (room.tournamentId) {
+              if (room.status === 'waiting' || room.status === 'ended') {
+                leaving.isConnected = false;
+                broadcastLog(room, `${originalName} saiu temporariamente da mesa de torneio.`, 'system');
+              } else if (
+                room.settings?.gameMode === 'team_2v2' ||
+                room.settings?.tournamentFormat === 'doubles_elimination'
+              ) {
+                executeTournamentDoublesTeamWO(room, leaving.id);
+              } else {
+                executeTournamentPlayerWO(room, leaving.id);
+              }
+            } else if (room.status === 'waiting' || room.status === 'ended') {
+              room.players.splice(idx, 1);
+              broadcastLog(room, `${originalName} saiu da sala.`, 'system');
+            } else {
+              // Active match (playing or paused) em sala normal: Um Robô assume as cartas e posição!
+              const cleanBotName = originalName.startsWith('Bot ') ? originalName : `Bot (${originalName})`;
+              leaving.isBot = true;
+              leaving.isConnected = true;
+              leaving.name = cleanBotName;
+              leaving.avatar = '🤖';
+
+              broadcastLog(
+                room,
+                `🤖 ${originalName} saiu da partida. Um Robô assumiu as cartas para o jogo continuar!`,
+                'system'
+              );
+
+              // If it was the leaving player's turn, trigger bot turn
+              if (room.status === 'playing' && room.players[room.currentTurnIndex]?.id === leaving.id) {
+                scheduleBotTurn(room, leaving);
+              }
+            }
+
+            const hasOnlineHumans = room.players.some((p) => !p.isBot && p.isConnected) || (room.spectators && room.spectators.length > 0);
+            if (!hasOnlineHumans && !room.tournamentId) {
+              cleanupRoomResources(room);
+            } else {
+              syncRoomState(room);
+            }
+          }
+        }
+        return;
+      }
+
+      if (msg.type === 'create_room') {
+        const isPrivate = !!msg.settings?.isPrivate;
+        const onlineMeta = onlinePlayers.get(ws);
+        if (onlineMeta?.authenticatedUserId) {
+          const rec = getUserRecordById(onlineMeta.authenticatedUserId);
+          if (rec && !isUserAccountActive(rec)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
+              ws.close(4003, 'Conta desativada ou arquivada.');
+            }
+            return;
+          }
+        }
+        if (isPrivate && (!onlineMeta || !onlineMeta.userId)) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Visitantes não podem criar salas privadas. Faça login.' }));
+          }
+          return;
+        }
+
+        const roomId = generateRoomId();
+        const is2v2 = msg.settings?.gameMode === 'team_2v2';
+        const hostPlayer: InternalPlayer = {
+          id: `player-${crypto.randomUUID()}`,
+          name: onlineMeta ? onlineMeta.name : (msg.playerName.trim() || 'Jogador 1'),
+          avatar: onlineMeta ? onlineMeta.avatar : (msg.avatar || '🦸‍♂️'),
+          isHost: true,
+          isBot: false,
+          team: is2v2 ? 'A' : undefined,
+          cardsCount: 0,
+          hasCalledUno: false,
+          isConnected: true,
+          score: 0,
+          hand: [],
+          hasDrawnThisTurn: false,
+        };
+
+        const duration = msg.settings?.turnDuration !== undefined ? msg.settings.turnDuration : 90;
+        const room: RoomData = {
+          id: roomId,
+          creatorName: hostPlayer.name,
+          ownerUserId: onlineMeta ? onlineMeta.userId : undefined,
+          settings: {
+            maxPlayers: is2v2 ? 4 : (msg.settings?.maxPlayers || 4),
+            gameMode: is2v2 ? 'team_2v2' : (msg.settings?.gameMode || 'standard'),
+            turnDuration: duration,
+            challengeUnoRule: msg.settings?.challengeUnoRule ?? true,
+            showBotCards: msg.settings?.showBotCards ?? false,
+            botSpeedMs: msg.settings?.botSpeedMs ?? 1800,
+            autoUnoProtection: msg.settings?.autoUnoProtection ?? false,
+            highlightHints: msg.settings?.highlightHints ?? true,
+            spectatorPermission: msg.settings?.spectatorPermission ?? 'hidden_cards',
+            isPrivate,
+          },
+          status: 'waiting',
+          players: [hostPlayer],
+          deck: [],
+          discardPile: [],
+          currentColor: 'red',
+          currentTurnIndex: 0,
+          turnDirection: 1,
+          turnTimeLeft: duration > 0 ? duration : 999,
+          winnerId: null,
+          winnerTeam: null,
+          unoVulnerablePlayerId: null,
+          turnTimerInterval: null,
+          botTimerTimeout: null,
+        };
+
+        rooms.set(roomId, room);
+        const reconnectToken = registerClientConnection(ws, socketId, roomId, hostPlayer.id);
+        updatePlayerRoom(ws, roomId);
+
+        ws.send(JSON.stringify({ type: 'room_joined', roomId, playerId: hostPlayer.id, reconnectToken }));
+        broadcastLog(room, `Sala ${roomId} criada por ${hostPlayer.name}.`, 'system');
+        syncRoomState(room);
+        return;
+      }
+
+      if (msg.type === 'sync_session') {
+        const cleanRoomId = (msg.roomId || '').replace(/[^A-Za-z0-9]/g, '').trim().toUpperCase();
+        const room = rooms.get(cleanRoomId);
+        const onlineMeta = onlinePlayers.get(ws);
+        if (onlineMeta?.authenticatedUserId) {
+          const rec = getUserRecordById(onlineMeta.authenticatedUserId);
+          if (rec && !isUserAccountActive(rec)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'action_rejected', messageId: msg.messageId, code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
+              ws.close(4003, 'Conta desativada ou arquivada.');
+            }
+            return;
+          }
+        }
+        if (room) {
+          const player = room.players.find((p) => p.id === msg.playerId);
+          if (player) {
+            if (room.tournamentId) {
+              if (!onlineMeta?.authenticatedUserId || player.userId !== onlineMeta.authenticatedUserId) {
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'action_rejected',
+                      messageId: msg.messageId,
+                      code: 'NOT_AUTHENTICATED' as const,
+                      message: 'Sessão de torneio exige usuário autenticado dono do assento.',
+                    })
+                  );
+                }
+                return;
+              }
+            }
+
+            const storedToken = sessionReconnectTokens.get(`${room.id}:${player.id}`);
+            if (storedToken && msg.reconnectToken && msg.reconnectToken !== storedToken) {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'action_rejected',
+                    messageId: msg.messageId,
+                    code: 'NOT_AUTHENTICATED' as const,
+                    message: 'Token de reconexão de sessão inválido.',
+                  })
+                );
+              }
+              return;
+            }
+
+            player.isConnected = true;
+            if (!room.tournamentId) {
+              const hasOtherOnlineHost = room.players.some((p) => p.isHost && !p.isBot && p.isConnected && p.id !== player.id);
+              const isCreator = !!(room.creatorName && player.name.toLowerCase() === room.creatorName.toLowerCase());
+              if (!hasOtherOnlineHost || isCreator) {
+                room.players.forEach((p) => { p.isHost = false; });
+                player.isHost = true;
+              }
+            }
+            const reconnectToken = registerClientConnection(ws, socketId, room.id, player.id, msg.reconnectToken);
+            updatePlayerRoom(ws, room.id);
+            ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: player.id, reconnectToken }));
+            syncRoomState(room);
+            return;
+          } else if (room.status === 'waiting' && !room.tournamentId) {
+            // Check if there is an offline player slot that was disconnected (apenas salas normais)
+            const disc = room.players.find((p) => !p.isBot && !p.isConnected);
+            if (disc) {
+              disc.isConnected = true;
+              const reconnectToken = registerClientConnection(ws, socketId, room.id, disc.id);
+              updatePlayerRoom(ws, room.id);
+              ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: disc.id, reconnectToken }));
+              syncRoomState(room);
+              return;
+            }
+          }
+        }
+        return;
+      }
+
+      if (msg.type === 'join_room') {
+        const rawRoomInput = (msg.roomId || '').trim();
+        const startsWithDollar = rawRoomInput.startsWith('$');
+        const startsWithStar = rawRoomInput.startsWith('*');
+        // Note: '@' is used as prefix in invite codes, so do NOT treat '@' as spectator mode
+        const wantsSpectator = msg.asSpectator === true || startsWithDollar || startsWithStar;
+        const wantsRevealHands = msg.spectatorRevealCards === true || startsWithDollar;
+
+        const cleanRoomId = rawRoomInput.replace(/[^A-Za-z0-9]/g, '').trim().toUpperCase();
+        const room = rooms.get(cleanRoomId);
+        const onlineMeta = onlinePlayers.get(ws);
+
+        if (onlineMeta?.authenticatedUserId) {
+          const rec = getUserRecordById(onlineMeta.authenticatedUserId);
+          if (rec && !isUserAccountActive(rec)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'action_rejected', messageId: msg.messageId, code: 'FORBIDDEN', message: 'Conta desativada ou arquivada pelo administrador.' }));
+              ws.close(4003, 'Conta desativada ou arquivada.');
+            }
+            return;
+          }
+        }
+
+        if (!room) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: `Sala #${cleanRoomId} não encontrada ou acesso restrito.`
+          }));
+          return;
+        }
+
+        // Fluxo estrito para salas de torneio (vínculo obrigatório por userId autenticado via JWT)
+        if (room.tournamentId) {
+          const linkedTournament = tournaments.get(room.tournamentId);
+          if (linkedTournament && isTournamentEnded(linkedTournament)) {
+            ws.send(JSON.stringify({
+              type: 'action_rejected',
+              messageId: msg.messageId,
+              code: 'FORBIDDEN' as const,
+              message: 'Este torneio já foi encerrado e não aceita novas participações.',
+            }));
+            return;
+          }
+
+          const authUserId = onlineMeta?.authenticatedUserId;
+          if (!authUserId) {
+            ws.send(JSON.stringify({
+              type: 'action_rejected',
+              messageId: msg.messageId,
+              code: 'NOT_AUTHENTICATED' as const,
+              message: 'Salas de torneio exigem usuário autenticado via token.',
+            }));
+            return;
+          }
+
+          if (wantsSpectator) {
+            const mode = room.tournamentSpectatorMode || 'table_only';
+            if (mode === 'table_only') {
+              ws.send(JSON.stringify({
+                type: 'action_rejected',
+                messageId: msg.messageId,
+                code: 'FORBIDDEN' as const,
+                message: 'Este torneio permite visualização apenas dos participantes da mesa.',
+              }));
+              return;
+            }
+
+            if (!room.spectators) room.spectators = [];
+            const spectatorId = `spectator-${authUserId}`;
+            const existingSpec = room.spectators.find((s) => s.id === spectatorId);
+            if (existingSpec) {
+              existingSpec.isConnected = true;
+            } else {
+              room.spectators.push({
+                id: spectatorId,
+                name: `[TV] ${onlineMeta?.name || msg.playerName?.trim() || 'Espectador'}`,
+                avatar: mode === 'tv_reveal' ? '📺' : '👁️',
+                isConnected: true,
+              });
+            }
+            room.spectatorCardsRevealed = mode === 'tv_reveal';
+            const reconnectToken = registerClientConnection(ws, socketId, room.id, spectatorId);
+            updatePlayerRoom(ws, room.id);
+            ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: spectatorId, reconnectToken }));
+            syncRoomState(room);
+            return;
+          }
+
+          const seat = room.players.find((p) => !p.isBot && p.userId === authUserId);
+          if (!seat) {
+            ws.send(JSON.stringify({
+              type: 'action_rejected',
+              messageId: msg.messageId,
+              code: 'FORBIDDEN' as const,
+              message: 'Usuário não está escalado para esta mesa do torneio.',
+            }));
+            return;
+          }
+
+          seat.isConnected = true;
+          if (msg.avatar) seat.avatar = msg.avatar;
+          const reconnectToken = registerClientConnection(ws, socketId, room.id, seat.id);
+          updatePlayerRoom(ws, room.id);
+          ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: seat.id, reconnectToken }));
+          broadcastLog(room, `🎯 ${seat.name} conectou ao assento oficial do torneio.`, 'system');
+          syncRoomState(room);
+          return;
+        }
+
+        // Private Room Authorization Check (salas normais)
+        if (room.settings.isPrivate) {
+          const userId = onlineMeta?.userId;
+          const isOwner = userId && room.ownerUserId === userId;
+          const hasAcceptedInvite = userId && Array.from(roomInvites.values()).some(
+            inv => inv.roomId === room.id && inv.targetUserId === userId && inv.status === 'accepted' && inv.expiresAt > Date.now()
+          );
+          const isExistingPlayer = msg.existingPlayerId && room.players.some(p => p.id === msg.existingPlayerId);
+
+          if (!isOwner && !hasAcceptedInvite && !isExistingPlayer) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: `Sala #${cleanRoomId} não encontrada ou acesso restrito.`
+            }));
+            return;
+          }
+        }
+
+        // If explicitly joining as Spectator / Tournament Broadcast
+        if (wantsSpectator) {
+          const permission = room.settings.spectatorPermission ?? 'hidden_cards';
+          if (permission === 'disabled') {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'O criador desta sala bloqueou o modo espectador / transmissão externa.'
+            }));
+            return;
+          }
+
+          const canRevealCards = permission === 'reveal_cards' && wantsRevealHands;
+
+          if (!room.spectators) room.spectators = [];
+          const spectatorId = `spectator-${Math.random().toString(36).substring(2, 9)}`;
+          const spectatorObj = {
+            id: spectatorId,
+            name: msg.playerName?.trim() ? `[TV] ${msg.playerName.trim()}` : `Espectador ${room.spectators.length + 1}`,
+            avatar: msg.avatar || (canRevealCards ? '📺' : '👁️'),
+            isConnected: true,
+          };
+
+          if (canRevealCards) {
+            room.spectatorCardsRevealed = true;
+          }
+
+          room.spectators.push(spectatorObj);
+          const reconnectToken = registerClientConnection(ws, socketId, room.id, spectatorId);
+
+          ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: spectatorId, reconnectToken }));
+          broadcastLog(
+            room,
+            `📺 ${spectatorObj.name} conectou na transmissão (${canRevealCards ? 'Cartas Abertas' : 'Apenas Mesa'})!`,
+            'system'
+          );
+          syncRoomState(room);
+          return;
+        }
+
+        const requestedName = msg.playerName.trim() || `Jogador ${room.players.length + 1}`;
+        const isOriginalCreator = !!(room.creatorName && requestedName.toLowerCase() === room.creatorName.toLowerCase());
+
+        // 1. Check if existing player in THIS room is reconnecting by existingPlayerId
+        if (msg.existingPlayerId) {
+          const existing = room.players.find((p) => p.id === msg.existingPlayerId);
+          if (existing) {
+            existing.isConnected = true;
+            if (msg.avatar) existing.avatar = msg.avatar;
+            if (msg.playerName?.trim()) existing.name = msg.playerName.trim();
+            const hasOtherOnlineHost = room.players.some((p) => p.isHost && !p.isBot && p.isConnected && p.id !== existing.id);
+            const isCreator = !!(room.creatorName && existing.name.toLowerCase() === room.creatorName.toLowerCase());
+            if (!hasOtherOnlineHost || isCreator) {
+              room.players.forEach((p) => { p.isHost = false; });
+              existing.isHost = true;
+            }
+            const reconnectToken = registerClientConnection(ws, socketId, room.id, existing.id);
+            updatePlayerRoom(ws, room.id);
+            ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: existing.id, reconnectToken }));
+            broadcastLog(room, `🔄 ${existing.name} reconectou à sala!`, 'system');
+            syncRoomState(room);
+            return;
+          }
+        }
+
+        // 2. Check if a player with matching name was disconnected in this room (reconnect slot)
+        const discMatch = room.players.find(
+          (p) => !p.isBot && !p.isConnected && p.name.trim().toLowerCase() === requestedName.toLowerCase()
+        );
+        if (discMatch) {
+          discMatch.isConnected = true;
+          if (msg.avatar) discMatch.avatar = msg.avatar;
+          const hasOtherOnlineHost = room.players.some((p) => p.isHost && !p.isBot && p.isConnected && p.id !== discMatch.id);
+          if (!hasOtherOnlineHost || isOriginalCreator) {
+            room.players.forEach((p) => { p.isHost = false; });
+            discMatch.isHost = true;
+          }
+          const reconnectToken = registerClientConnection(ws, socketId, room.id, discMatch.id);
+          updatePlayerRoom(ws, room.id);
+          ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: discMatch.id, reconnectToken }));
+          broadcastLog(room, `🔄 ${discMatch.name} reconectou à sala!`, 'system');
+          syncRoomState(room);
+          return;
+        }
+
+        // 3. If game is already in progress and not an existing player: join as waiting spectator
+        if (room.status === 'playing') {
+          if (!room.spectators) room.spectators = [];
+          const spectatorId = `spectator-${Math.random().toString(36).substring(2, 9)}`;
+          const spectatorObj = {
+            id: spectatorId,
+            name: requestedName || `Espectador ${room.spectators.length + 1}`,
+            avatar: msg.avatar || '👀',
+            isConnected: true,
+          };
+          room.spectators.push(spectatorObj);
+          const reconnectToken = registerClientConnection(ws, socketId, room.id, spectatorId);
+          updatePlayerRoom(ws, room.id);
+
+          ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: spectatorId, reconnectToken }));
+          broadcastLog(room, `👀 ${spectatorObj.name} entrou na sala como Espectador (Aguardando próxima rodada)!`, 'system');
+          syncRoomState(room);
+          return;
+        }
+
+        // 4. Room is waiting: If room has bot and is full, replace a bot for human player
+        if (room.players.length >= room.settings.maxPlayers) {
+          const botIdx = room.players.findIndex((p) => p.isBot);
+          if (botIdx !== -1) {
+            const removedBot = room.players.splice(botIdx, 1)[0];
+            broadcastLog(room, `🤖 ${removedBot.name} deu espaço para ${requestedName} entrar na mesa.`, 'system');
+          } else {
+            ws.send(JSON.stringify({ type: 'error', message: 'A sala já está cheia (máximo de 4 jogadores atingido).' }));
+            return;
+          }
+        }
+
+        // 5. Check if active online player already has this exact name
+        const isNameTakenInRoom = room.players.some(
+          (p) => p.isConnected && !p.isBot && p.name.trim().toLowerCase() === requestedName.toLowerCase()
+        );
+        if (isNameTakenInRoom) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: `O nome "${requestedName}" já está em uso por outro jogador conectado nesta sala! Escolha outro apelido ou nome para entrar.`
+          }));
+          return;
+        }
+
+        const hasOnlineHost = room.players.some((p) => p.isHost && !p.isBot && p.isConnected);
+        const shouldBeHost = !hasOnlineHost || isOriginalCreator;
+
+        if (shouldBeHost && isOriginalCreator) {
+          room.players.forEach((p) => { p.isHost = false; });
+        }
+
+        const newPlayer: InternalPlayer = {
+          id: `player-${Math.random().toString(36).substring(2, 9)}`,
+          name: requestedName,
+          avatar: msg.avatar || '🎲',
+          isHost: shouldBeHost,
+          isBot: false,
+          cardsCount: 0,
+          hasCalledUno: false,
+          isConnected: true,
+          score: 0,
+          hand: [],
+          hasDrawnThisTurn: false,
+        };
+
+        room.players.push(newPlayer);
+        const reconnectToken = registerClientConnection(ws, socketId, room.id, newPlayer.id);
+        updatePlayerRoom(ws, room.id);
+
+        ws.send(JSON.stringify({ type: 'room_joined', roomId: room.id, playerId: newPlayer.id, reconnectToken }));
+
+        broadcastLog(room, `${newPlayer.name} entrou na sala!`, 'system');
+        syncRoomState(room);
+        return;
+      }
+
+      // Public Open Rooms WebSocket Message
+      if (msg.type === 'get_open_rooms') {
+        const openRooms: OpenRoomSummary[] = Array.from(rooms.values())
+          .filter((r) => !r.settings?.isPrivate && !r.tournamentId && r.players.some((p) => !p.isBot && p.isConnected))
+          .map((r) => {
+            const host = r.players.find((p) => p.isHost && !p.isBot) || r.players.find((p) => !p.isBot) || r.players[0];
+            return {
+              id: r.id,
+              status: r.status,
+              playersCount: r.players.length,
+              maxPlayers: r.settings.maxPlayers,
+              hostName: host ? host.name : 'Anfitrião',
+              hostAvatar: host ? host.avatar : '🎲',
+              turnDuration: r.settings.turnDuration,
+              spectatorsCount: r.spectators?.length || 0,
+              players: r.players.map((p) => ({
+                name: p.name,
+                avatar: p.avatar,
+                isHost: p.isHost,
+                isBot: p.isBot,
+              })),
+            };
+          });
+        ws.send(JSON.stringify({ type: 'open_rooms_list', rooms: openRooms }));
+        return;
+      }
+
+      // Global Admin WebSocket Messages
+      if (msg.type === 'admin_get_rooms') {
+        const isAdm = verifyAdminPin(msg.adminSecret);
+        if (isAdm) {
+          const list = Array.from(rooms.values()).map((r) => ({
+            id: r.id,
+            status: r.status,
+            playersCount: r.players.length,
+            maxPlayers: r.settings.maxPlayers,
+            turnDuration: r.settings.turnDuration,
+            roundTurnCount: r.roundTurnCount || 0,
+            players: r.players.map((p) => ({
+              id: p.id,
+              name: p.name,
+              avatar: p.avatar,
+              isHost: p.isHost,
+              isBot: p.isBot,
+              isConnected: p.isConnected,
+              cardsCount: p.hand?.length || 0,
+            })),
+          }));
+          ws.send(JSON.stringify({ type: 'admin_rooms_list', rooms: list }));
+        }
+        return;
+      }
+
+      if (msg.type === 'admin_close_room') {
+        const isAdm = verifyAdminPin(msg.adminSecret);
+        if (isAdm) {
+          const targetRoom = rooms.get(msg.roomId?.toUpperCase());
+          if (targetRoom) {
+            broadcastToRoom(targetRoom.id, {
+              type: 'player_kicked',
+              reason: msg.reason || 'Esta sala foi encerrada pelo Administrador Edinho.',
+            });
+            cleanupRoomResources(targetRoom);
+          }
+        }
+        return;
+      }
+
+      if (msg.type === 'admin_force_end_game') {
+        const isAdm = verifyAdminPin(msg.adminSecret);
+        if (isAdm) {
+          const targetRoom = rooms.get(msg.roomId?.toUpperCase());
+          if (targetRoom) {
+            stopTurnTimer(targetRoom);
+            targetRoom.status = 'waiting';
+            targetRoom.winnerId = null;
+            targetRoom.unoVulnerablePlayerId = null;
+            targetRoom.discardPile = [];
+            targetRoom.deck = [];
+            targetRoom.players.forEach((p) => {
+              p.hand = [];
+              p.hasCalledUno = false;
+              p.hasDrawnThisTurn = false;
+            });
+            broadcastLog(targetRoom, '⚠️ Partida encerrada pelo Administrador. A sala retornou ao Lobby.', 'system');
+            syncRoomState(targetRoom);
+          }
+        }
+        return;
+      }
+
+      if (msg.type === 'admin_global_broadcast') {
+        const isAdm = verifyAdminPin(msg.adminSecret);
+        if (isAdm && msg.message) {
+          const announcement: ServerMessage = {
+            type: 'global_announcement',
+            message: msg.message.trim(),
+            sender: msg.sender || '👑 Admin Edinho',
+            timestamp: Date.now(),
+          };
+          rooms.forEach((r) => {
+            broadcastToRoom(r.id, announcement);
+            broadcastLog(r, `📢 [AVISO GLOBAL]: ${msg.message}`, 'system', msg.sender || 'Admin Edinho');
+          });
+        }
+        return;
+      }
+
+      const meta = clientConnections.get(ws);
+      if (!meta) return;
+
+      const room = rooms.get(meta.roomId.toUpperCase());
+      if (!room) return;
+      const player = room.players.find((p) => p.id === meta.playerId);
+      if (!player) return;
+
+      const rejectTournamentMutation = (reason: string) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: 'action_rejected',
+              messageId: msg.messageId,
+              code: 'FORBIDDEN' as const,
+              message: reason,
+            })
+          );
+        }
+      };
+
+      if (msg.type === 'add_bot') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Salas de torneio não permitem adicionar robôs.');
+          return;
+        }
+        if (!player.isHost) return;
+        if (room.players.length >= room.settings.maxPlayers) return;
+
+        const newBot = addBotToRoom(room);
+        if (newBot) {
+          broadcastLog(room, `${newBot.name} foi adicionado à mesa.`, 'system');
+          syncRoomState(room);
+        }
+        return;
+      }
+
+      if (msg.type === 'fill_bots') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Salas de torneio não permitem preencher vagas com robôs.');
+          return;
+        }
+        if (!player.isHost) return;
+        let addedCount = 0;
+        while (room.players.length < room.settings.maxPlayers) {
+          const newBot = addBotToRoom(room);
+          if (newBot) addedCount++;
+        }
+        if (addedCount > 0) {
+          broadcastLog(room, `${addedCount} robôs entraram na sala para completar a mesa!`, 'system');
+          syncRoomState(room);
+        }
+        return;
+      }
+
+      if (msg.type === 'remove_bot') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Ação bloqueada em salas de torneio.');
+          return;
+        }
+        if (!player.isHost) return;
+        const idx = room.players.findIndex((p) => p.id === msg.botId && p.isBot);
+        if (idx !== -1) {
+          const removed = room.players.splice(idx, 1)[0];
+          broadcastLog(room, `${removed.name} foi removido.`, 'system');
+          syncRoomState(room);
+        }
+        return;
+      }
+
+      if (msg.type === 'kick_player') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Expulsão manual é bloqueada em salas de torneio.');
+          return;
+        }
+        if (!player.isHost) return;
+        if (msg.targetPlayerId === player.id) return; // Cannot kick self
+
+        const idx = room.players.findIndex((p) => p.id === msg.targetPlayerId);
+        if (idx !== -1) {
+          const target = room.players.splice(idx, 1)[0];
+          // Notify target player connection
+          const targetSockets = roomSockets.get(room.id);
+          if (targetSockets) {
+            for (const wsClient of Array.from(targetSockets)) {
+              const meta = clientConnections.get(wsClient);
+              if (meta && meta.playerId === target.id) {
+                safeWsSend(
+                  wsClient,
+                  JSON.stringify({
+                    type: 'player_kicked',
+                    reason: msg.reason || `Você foi expulso da sala por ${player.name}.`,
+                  })
+                );
+                removeClientConnection(wsClient);
+              }
+            }
+          }
+
+          broadcastLog(room, `🚫 ${target.name} foi expulso da sala por ${player.name}.`, 'system');
+          syncRoomState(room);
+        }
+        return;
+      }
+
+      if (msg.type === 'transfer_host') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Transferência de anfitrião não se aplica a salas de torneio.');
+          return;
+        }
+        if (!player.isHost) return;
+        const target = room.players.find((p) => p.id === msg.targetPlayerId && !p.isBot && p.isConnected);
+        if (target && target.id !== player.id) {
+          player.isHost = false;
+          target.isHost = true;
+          broadcastLog(room, `👑 ${target.name} foi promovido a novo Anfitrião da sala!`, 'system');
+          syncRoomState(room);
+        }
+        return;
+      }
+
+      if (msg.type === 'claim_host') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Assunção manual de anfitrião é bloqueada em salas de torneio.');
+          return;
+        }
+        const targetPlayer = player || room.players.find((p) => p.id === msg.playerId);
+        if (!targetPlayer) return;
+
+        room.players.forEach((p) => {
+          p.isHost = false;
+        });
+        targetPlayer.isHost = true;
+        broadcastLog(room, `👑 ${targetPlayer.name} assumiu a liderança como Anfitrião da sala!`, 'system');
+        syncRoomState(room);
+        return;
+      }
+
+      if (msg.type === 'update_settings') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Configurações de sala de torneio não podem ser alteradas manualmente.');
+          return;
+        }
+        if (!player.isHost) return;
+        room.settings = {
+          ...room.settings,
+          ...msg.settings,
+        };
+        if (room.settings.gameMode === 'team_2v2') {
+          room.settings.maxPlayers = 4;
+        }
+        broadcastLog(room, `⚙️ As configurações da mesa foram atualizadas!`, 'system');
+        syncRoomState(room);
+        return;
+      }
+
+      if (msg.type === 'set_team') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Equipes em torneios são definidas exclusivamente pelo chaveamento.');
+          return;
+        }
+        if (room.status !== 'waiting') return;
+        const targetId = (player.isHost && msg.targetPlayerId) ? msg.targetPlayerId : player.id;
+        const targetPlayer = room.players.find((p) => p.id === targetId);
+        if (targetPlayer && (msg.team === 'A' || msg.team === 'B')) {
+          targetPlayer.team = msg.team;
+          broadcastLog(room, `👥 ${targetPlayer.name} agora está na Equipe ${msg.team}!`, 'system');
+          syncRoomState(room);
+        }
+        return;
+      }
+
+      if (msg.type === 'start_game' || msg.type === 'restart_game') {
+        if (room.tournamentId) {
+          if (msg.type === 'restart_game') {
+            rejectTournamentMutation('Reinício manual de partida é proibido em salas de torneio.');
+            return;
+          }
+          const linkedTournament = tournaments.get(room.tournamentId);
+          if (!linkedTournament || isTournamentEnded(linkedTournament) || linkedTournament.status !== 'running') {
+            rejectTournamentMutation('Este torneio já foi encerrado ou não está em execução.');
+            return;
+          }
+          const callerSession = onlinePlayers.get(ws);
+          if (callerSession?.authenticatedRole !== 'admin') {
+            rejectTournamentMutation('Apenas administradores podem iniciar manualmente uma mesa de torneio.');
+            return;
+          }
+          if (room.players.some((p) => p.isBot)) {
+            rejectTournamentMutation('Salas de torneio não permitem robôs.');
+            return;
+          }
+          if (room.players.length < 2 || room.players.some((p) => !p.isConnected || !p.userId)) {
+            rejectTournamentMutation('Todos os jogadores reais escalados devem estar conectados para iniciar a partida do torneio.');
+            return;
+          }
+          room.rematchVotes = {};
+          startGame(room);
+          return;
+        }
+
+        // Ensure player requesting start is recognized as host if no active host exists
+        if (!player.isHost) {
+          const hasActiveHost = room.players.some((p) => p.isHost && !p.isBot && p.isConnected);
+          if (!hasActiveHost || msg.type === 'start_game') {
+            room.players.forEach((p) => { p.isHost = false; });
+            player.isHost = true;
+          }
+        }
+
+        // Clean disconnected human players before starting (apenas salas normais)
+        room.players = room.players.filter((p) => p.isBot || p.isConnected);
+
+        // Ensure minimum 2 players by auto-adding a Bot if needed (apenas salas normais)
+        if (room.players.length < 2) {
+          addBotToRoom(room);
+        }
+
+        room.rematchVotes = {};
+        startGame(room);
+        return;
+      }
+
+      if (msg.type === 'pause_game') {
+        if (room.status !== 'playing') return;
+        stopTurnTimer(room);
+        room.status = 'paused';
+        broadcastLog(room, `⏸️ ${player.name} pausou a partida!`, 'system');
+        syncRoomState(room);
+        return;
+      }
+
+      if (msg.type === 'resume_game') {
+        if (room.status !== 'paused') return;
+        room.status = 'playing';
+        startTurnTimer(room);
+        broadcastLog(room, `▶️ ${player.name} retomou a partida!`, 'system');
+        syncRoomState(room);
+        return;
+      }
+
+      if (msg.type === 'return_to_lobby' || msg.type === 'reset_room') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Salas de torneio não podem retornar ao lobby livre.');
+          return;
+        }
+        stopTurnTimer(room);
+        room.status = 'waiting';
+        room.winnerId = null;
+        room.winnerTeam = null;
+        room.unoVulnerablePlayerId = null;
+        room.discardPile = [];
+        room.deck = [];
+        room.stagedCardPlay = null;
+        room.woRemovedPlayerIds = [];
+        room.pendingWoPlayerIds = [];
+        room.rematchVotes = {};
+
+        // Clean out disconnected human players
+        room.players = room.players.filter((p) => p.isBot || p.isConnected);
+
+        // Ensure an active host exists
+        const hasHost = room.players.some((p) => p.isHost && !p.isBot && p.isConnected);
+        if (!hasHost) {
+          const firstHuman = room.players.find((p) => !p.isBot && p.isConnected);
+          if (firstHuman) {
+            firstHuman.isHost = true;
+          }
+        }
+
+        // Reset player cards
+        room.players.forEach((p) => {
+          p.hand = [];
+          p.hasCalledUno = false;
+          p.hasDrawnThisTurn = false;
+        });
+
+        broadcastLog(room, `🏠 A sala voltou para o Lobby de espera. Pronto para configurar ou iniciar nova partida!`, 'system');
+        syncRoomState(room);
+        scheduleBroadcastOnlinePlayers();
+        return;
+      }
+
+      if (msg.type === 'vote_rematch') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Revanche livre não se aplica a partidas oficiais de torneio.');
+          return;
+        }
+        if (!room.rematchVotes) room.rematchVotes = {};
+        const pId = msg.playerId || player?.id || '';
+        const playerName = player ? player.name : (room.spectators?.find((s) => s.id === pId)?.name || 'Jogador');
+
+        room.rematchVotes[pId] = {
+          playerId: pId,
+          playerName,
+          ready: msg.ready,
+          phrase: msg.phrase,
+          timestamp: Date.now(),
+        };
+
+        if (msg.phrase) {
+          broadcastLog(room, `💬 ${playerName}: "${msg.phrase}"`, 'chat', playerName);
+        }
+        syncRoomState(room);
+
+        // Check if all connected human players voted ready
+        const humanPlayers = room.players.filter((p) => !p.isBot && p.isConnected);
+        const readyCount = humanPlayers.filter((p) => room.rematchVotes?.[p.id]?.ready).length;
+        if (humanPlayers.length > 0 && readyCount === humanPlayers.length && room.status === 'ended') {
+          broadcastLog(room, `✨ Todos os jogadores confirmaram! Iniciando nova rodada...`, 'system');
+          setTimeout(() => {
+            room.rematchVotes = {};
+            startGame(room);
+          }, 1500);
+        }
+        return;
+      }
+
+      if (msg.type === 'toggle_spectator_reveal') {
+        if (room.tournamentId) {
+          rejectTournamentMutation('Visibilidade de espectadores em torneio é controlada exclusivamente pela política do torneio.');
+          return;
+        }
+        if (player && player.isHost) {
+          room.spectatorCardsRevealed = msg.reveal;
+          broadcastLog(room, `👁️ O Anfitrião ${msg.reveal ? 'liberou a visão das cartas para os Espectadores' : 'ocultou as cartas dos Espectadores'}.`, 'system');
+          syncRoomState(room);
+        }
+        return;
+      }
+
+      if (msg.type === 'play_card') {
+        if (room.status !== 'playing') return;
+        if (room.players[room.currentTurnIndex].id !== player.id) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Aguarde a sua vez de jogar!' }));
+          return;
+        }
+
+        executePlayCard(room, player, msg.cardId, msg.chosenColor, ws);
+        return;
+      }
+
+      if (msg.type === 'draw_card') {
+        if (room.status !== 'playing') return;
+        if (room.players[room.currentTurnIndex].id !== player.id) return;
+        if (player.hasDrawnThisTurn) return;
+
+        const drawn = drawCardsFromDeck(room, 1);
+        player.hand.push(...drawn);
+        player.cardsCount = player.hand.length;
+        player.hasDrawnThisTurn = true;
+        
+        // Drawing a card ends the opportunity for the current player to catch a previous UNO
+        room.unoVulnerablePlayerId = null;
+        delete room.unoVulnerableTurnCount;
+
+        broadcastLog(room, `${player.name} comprou 1 carta.`, 'action', player.name);
+        broadcastSound(room.id, 'draw');
+        syncRoomState(room);
+        return;
+      }
+
+      if (msg.type === 'pass_turn') {
+        if (room.status !== 'playing') return;
+        if (room.players[room.currentTurnIndex].id !== player.id) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'action_rejected', messageId: msg.messageId, code: 'NOT_YOUR_TURN' as const, message: 'Aguarde a sua vez de jogar!' }));
+          }
+          return;
+        }
+        if (!player.hasDrawnThisTurn) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'action_rejected', messageId: msg.messageId, code: 'MUST_DRAW_FIRST' as const, message: 'Você precisa comprar uma carta antes de passar a vez!' }));
+          }
+          return;
+        }
+
+        broadcastLog(room, `${player.name} passou a vez.`, 'action', player.name);
+        advanceTurn(room, 1);
+        return;
+      }
+
+
+      if (msg.type === 'call_uno') {
+        if (room.status !== 'playing') return;
+        if (player.hand.length <= 2) {
+          player.hasCalledUno = true;
+          if (room.unoVulnerablePlayerId === player.id) {
+            room.unoVulnerablePlayerId = null;
+          }
+          broadcastLog(room, `🔊 ${player.name} gritou: "UNO!"`, 'uno', player.name);
+          broadcastSound(room.id, 'uno');
+          syncRoomState(room);
+        }
+        return;
+      }
+
+      if (msg.type === 'catch_uno') {
+        if (room.status !== 'playing') return;
+        if (msg.targetPlayerId === player.id) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: 'action_rejected',
+                messageId: msg.messageId,
+                code: 'UNO_SELF_CATCH' as const,
+                message: 'Você não pode aplicar a penalidades de UNO a si próprio.',
+              })
+            );
+          }
+          return;
+        }
+
+        const target = room.players.find((p) => p.id === msg.targetPlayerId);
+        if (room.settings.gameMode === 'team_2v2' && player.team && target?.team === player.team) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: 'error',
+                message: 'Você não pode penalizar seu próprio parceiro de equipe!',
+              })
+            );
+          }
+          return;
+        }
+
+        if (room.unoVulnerablePlayerId === msg.targetPlayerId) {
+          if (target && target.hand.length === 1 && !target.hasCalledUno) {
+            const penalties = drawCardsFromDeck(room, 2);
+            target.hand.push(...penalties);
+            room.unoVulnerablePlayerId = null;
+            broadcastLog(room, `🚨 ${player.name} pegou ${target.name} sem falar UNO! ${target.name} comprou 2 cartas de penalidade!`, 'penalty', player.name);
+            broadcastSound(room.id, 'penalty');
+            syncRoomState(room);
+          }
+        }
+        return;
+      }
+
+
+      if (msg.type === 'send_chat') {
+        const text = msg.text.trim();
+        if (!text) return;
+
+        const chatMsg: ChatMessage = {
+          id: Math.random().toString(36).substring(2, 9),
+          playerId: player.id,
+          playerName: player.name,
+          avatar: player.avatar,
+          text,
+          timestamp: Date.now(),
+        };
+
+        broadcastToRoom(room.id, { type: 'chat_message', message: chatMsg });
+        return;
+      }
+
+      if (msg.type === 'send_emote') {
+        const emote = EMOTES_MAP[msg.emoteId];
+        if (!emote) return;
+
+        broadcastToRoom(room.id, {
+          type: 'player_emote',
+          emote: {
+            id: `emote-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            playerId: player.id,
+            emoteId: emote.id,
+            emoji: emote.emoji,
+            phrase: emote.phrase,
+            soundType: emote.soundType,
+            timestamp: Date.now(),
+          },
+        });
+        return;
+      }
+
+      // WebRTC Peer-to-Peer Voice Signaling (Zero server audio processing)
+      if (msg.type === 'rtc_offer') {
+        const targetPlayerId = msg.toPlayerId;
+        const sockets = roomSockets.get(room.id);
+        if (sockets) {
+          for (const clientWs of sockets) {
+            const clientMeta = clientConnections.get(clientWs);
+            if (clientMeta && clientMeta.playerId === targetPlayerId) {
+              safeWsSend(clientWs, JSON.stringify({
+                type: 'rtc_offer',
+                fromPlayerId: player.id,
+                toPlayerId: targetPlayerId,
+                offer: msg.offer,
+              }));
+              break;
+            }
+          }
+        }
+        return;
+      }
+
+      if (msg.type === 'rtc_answer') {
+        const targetPlayerId = msg.toPlayerId;
+        const sockets = roomSockets.get(room.id);
+        if (sockets) {
+          for (const clientWs of sockets) {
+            const clientMeta = clientConnections.get(clientWs);
+            if (clientMeta && clientMeta.playerId === targetPlayerId) {
+              safeWsSend(clientWs, JSON.stringify({
+                type: 'rtc_answer',
+                fromPlayerId: player.id,
+                toPlayerId: targetPlayerId,
+                answer: msg.answer,
+              }));
+              break;
+            }
+          }
+        }
+        return;
+      }
+
+      if (msg.type === 'rtc_ice_candidate') {
+        const targetPlayerId = msg.toPlayerId;
+        const sockets = roomSockets.get(room.id);
+        if (sockets) {
+          for (const clientWs of sockets) {
+            const clientMeta = clientConnections.get(clientWs);
+            if (clientMeta && clientMeta.playerId === targetPlayerId) {
+              safeWsSend(clientWs, JSON.stringify({
+                type: 'rtc_ice_candidate',
+                fromPlayerId: player.id,
+                toPlayerId: targetPlayerId,
+                candidate: msg.candidate,
+              }));
+              break;
+            }
+          }
+        }
+        return;
+      }
+
+      if (msg.type === 'rtc_voice_state') {
+        broadcastToRoom(room.id, {
+          type: 'rtc_voice_state',
+          roomId: room.id,
+          playerId: player.id,
+          isMuted: !!msg.isMuted,
+          isDeafened: !!msg.isDeafened,
+          isSpeaking: !!msg.isSpeaking,
+          joined: !!msg.joined,
+        });
+        return;
+      }
+
+
+      // Automatically keep onlinePlayers roomId in sync with clientConnections!
+      const conn = clientConnections.get(ws);
+      const onlineMeta = onlinePlayers.get(ws);
+      if (onlineMeta) {
+        const targetRoomId = conn ? conn.roomId : null;
+        if (onlineMeta.roomId !== targetRoomId) {
+          onlineMeta.roomId = targetRoomId;
+          onlineMeta.inRoom = targetRoomId !== null;
+          scheduleBroadcastOnlinePlayers();
+        }
+      }
+    } catch (e) {
+      console.error('Error handling WebSocket message:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    // Delete from online lobby registry & per-socket rate limit maps to prevent memory leaks
+    aliveSockets.delete(ws);
+    lobbyChatRateLimits.delete(ws);
+    startSoloRateLimits.delete(ws);
+    onlinePlayers.delete(ws);
+    scheduleBroadcastOnlinePlayers();
+
+    const meta = removeClientConnection(ws);
+    if (!meta) return;
+
+    const room = rooms.get(meta.roomId);
+    if (!room) return;
+
+    const player = room.players.find((p) => p.id === meta.playerId);
+    if (player) {
+      player.isConnected = false;
+      broadcastLog(room, `${player.name} desconectou.`, 'system');
+
+      if (player.isHost) {
+        player.isHost = false;
+        const nextHost = room.players.find((p) => !p.isBot && p.isConnected && p.id !== player.id);
+        if (nextHost) {
+          nextHost.isHost = true;
+          broadcastLog(room, `👑 ${nextHost.name} agora é o novo Anfitrião da sala!`, 'system');
+        }
+      }
+
+      const hasOnlineHumans = room.players.some((p) => !p.isBot && p.isConnected);
+      if (!hasOnlineHumans) {
+        if (!room.tournamentId) {
+          // Keep normal rooms alive for 5 minutes so other players can join or the host can reconnect!
+          if (!room.emptyRoomTimeout) {
+            room.emptyRoomTimeout = setTimeout(() => {
+              const currentRoom = rooms.get(room.id);
+              if (currentRoom) {
+                const stillNoHumans = currentRoom.players.every((p) => p.isBot || !p.isConnected);
+                if (stillNoHumans) {
+                  cleanupRoomResources(currentRoom);
+                  console.log(`[Room Cleanup] Sala #${currentRoom.id} encerrada por inatividade (5min).`);
+                }
+              }
+            }, 5 * 60 * 1000);
+          }
+        } else {
+          syncRoomState(room);
+        }
+      } else {
+        syncRoomState(room);
+      }
+    } else if (room.spectators) {
+      room.spectators = room.spectators.filter((s) => s.id !== meta.playerId);
+      syncRoomState(room);
+    }
+  });
+});
+
+// Production vs Dev mode setup
+async function startServer() {
+  try {
+    const rec = await reconcileIncompleteImportBatches(tournaments, saveTournaments);
+    if (rec.reconciledCount > 0) {
+      console.log(`🔄 [IMPORT RECONCILIATION] ${rec.reconciledCount} lote(s) interrompido(s) reconciliado(s): ${rec.batchIds.join(', ')}`);
+    }
+  } catch (err) {
+    console.error('Erro ao reconciliar lotes de importação no boot:', err);
+  }
+
+  // Ensure unknown /api/* routes and API middleware errors always return JSON (never SPA HTML)
+  app.use('/api', (_req, res) => {
+    return res.status(404).json({ success: false, error: 'Endpoint de API não encontrado.' });
+  });
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.path.startsWith('/api')) {
+      console.error('Erro não tratado em rota /api:', err);
+      return res.status(err?.status || 500).json({
+        success: false,
+        error: err?.message || 'Erro interno na API.',
+      });
+    }
+    return next(err);
+  });
+
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(process.cwd(), 'dist');
+    const assetsPath = path.join(distPath, 'assets');
+    app.use('/assets', express.static(assetsPath, { maxAge: '30d', immutable: true }));
+    app.use(express.static(distPath, { maxAge: '1h', setHeaders: (res, filePath) => {
+      if (filePath.endsWith('index.html')) {
+        res.setHeader('Cache-Control', 'no-cache');
+      }
+    } }));
+    app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`  ➜  Local:   http://localhost:${PORT}/`);
+    console.log(`  ➜  Network: http://0.0.0.0:${PORT}/`);
+    console.log(`UNO Multiplayer Server running on http://localhost:${PORT}/`);
+  });
+}
+
+if (!process.env.VITEST && process.env.DISABLE_AUTO_START !== 'true') {
+  startServer();
+}
+
+export {
+  app,
+  server,
+  wss,
+  rooms,
+  tournaments,
+  saveTournaments,
+  saveTournamentsStrict,
+  getAllStats,
+  saveStatsStrict,
+  startGame,
+  executeTournamentPlayerWO,
+  executeTournamentDoublesTeamWO,
+  checkWinCondition,
+  createTournamentRoomForGame,
+  launchNextPendingTournamentGames,
+};

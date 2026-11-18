@@ -1,0 +1,122 @@
+# 🃏 MANUAL DE JOGO — UNO KAWIHE v2.2
+
+Bem-vindo ao **Uno KaWiHe v2.2**, o jogo de cartas mais divertido do mundo feito sob medida para brincar com a família, amigos e crianças em um ambiente seguro, privado, sem anúncios e totalmente autoritativo! Este manual explica passo a passo o funcionamento do jogo, o significado de cada carta, as regras oficiais aplicadas, a disposição visual da mesa e as proteções especiais do nosso sistema.
+
+---
+
+## 🌟 1. Objetivo do Jogo
+O objetivo principal é simples: ser o **primeiro jogador a ficar sem cartas na mão**!  
+A cada rodada que você ganha, você acumula pontos com base nas cartas que sobraram na mão dos seus adversários. O primeiro a atingir a meta da mesa consagra-se o grande campeão da sessão!
+
+---
+
+## 🎮 2. Como Funciona a Partida (O Fluxo de Turno Autoritativo)
+Na sua vez de jogar, você deve comparar a carta que está no topo da **Pilha de Descarte (Mesa)** com as cartas da sua mão.
+
+Você pode jogar uma carta da sua mão se ela corresponder a **pelo menos um** dos seguintes critérios:
+1. **Mesma Cor:** A carta tem a mesma cor da carta da mesa (Vermelho, Azul, Verde ou Amarelo) ou da cor ativa escolhida (`activeColor`).
+2. **Mesmo Número ou Símbolo:** A carta tem o mesmo número (0-9) ou o mesmo símbolo especial (Pular, Inverter, +2).
+3. **Coringa:** Cartas pretas especiais (Coringa comum ou Coringa +4) podem ser jogadas sobre **qualquer** cor ou número da mesa!
+
+> 💡 **Se você não tiver nenhuma carta jogável:** Você clica no baralho para **Comprar uma Carta**. Depois de comprar, se a carta for jogável, você pode jogá-la; caso contrário, deve passar clicando no botão *"Passar Turno"*.  
+> 🛡️ **Garantia de Regra:** O servidor não permite passar o turno sem antes comprar pelo menos uma carta (retornando a mensagem de segurança `MUST_DRAW_FIRST`).
+
+---
+
+## ⏱️ 3. Regra de Tempo e Expiração de Turno
+Cada turno possui um tempo limite configurável na sala (ex: 15s, 25s, 40s ou tempo ilimitado no Modo Criança).
+- **Se você ainda NÃO comprou uma carta no seu turno** e o tempo acabar: O servidor saca 1 carta automaticamente para você e passa a vez para o próximo jogador.
+- **Se você JÁ comprou uma carta no seu turno** e o tempo acabar: O servidor não adiciona cartas extras; ele apenas encerra o seu tempo e **passa a vez automaticamente**.
+
+---
+
+## 📐 4. Disposição do Tabuleiro e Mesa de Jogo
+A mesa de jogo foi desenvolvida em formato radial curvo e proporcional, otimizada para telas de celular e monitores sem que nenhum elemento fique espremido:
+
+* **Sua Mão (Base - 0°):** Suas cartas ficam organizadas na parte inferior da tela, com destaque visual autoritativo gerado pelo servidor apenas para as cartas válidas de jogar, botões de ação e o grande botão de gritar **UNO!**.
+* **Oponente da Esquerda (90°) & Direita (270°):** Cards verticais compactos e bem posicionados nas laterais, exibindo a contagem de cartas do oponente.
+* **Oponente do Topo (180°):** Disposição especial horizontal lado a lado (*Side-by-Side*), com dimensões sólidas (avatar de 40px e representação visual das cartas lado a lado) mantendo perfeita leitura em qualquer tela.
+
+---
+
+## 🎨 5. Guia de Cartas Especiais
+
+| Carta | Nome da Carta | Efeito Prático no Jogo |
+| :---: | :--- | :--- |
+| 🚫 | **Bloqueio (Pular)** | O próximo jogador na linha de turnos **perde a vez** de jogar. |
+| 🔄 | **Inverter Sentido** | Muda o fluxo da mesa! Se o jogo estava rodando no sentido horário, ele passa a rodar no sentido anti-horário. *Nota: Se a partida for de apenas 2 jogadores, ela funciona como uma carta de Bloqueio.* |
+| ➕2 | **Comprar Duas (+2)** | O próximo jogador é obrigado a **comprar 2 cartas do baralho** e ainda **perde a vez** de jogar naquela rodada. |
+| 🎨 | **Coringa Comum** | Pode ser jogado sobre qualquer carta. Quem o joga escolhe qual será a **nova cor** que continuará o jogo (Vermelho, Azul, Verde ou Amarelo). |
+| ➕4 | **Coringa Comprar Quatro (+4)** | A carta mais poderosa! Além de permitir que você escolha a nova cor do jogo, o próximo jogador é obrigado a **comprar 4 cartas do baralho** e **perde a vez**. |
+
+---
+
+## 📢 6. A Regra Sagrada do "UNO!"
+Quando você jogar uma carta e perceber que ficou com **apenas 1 carta restante na mão**, você deve **gritar UNO**!
+
+* **Como fazer isso no jogo:** Clique no botão brilhante **`[ 📢 GRITAR UNO! ]`** quando estiver com 1 ou 2 cartas!
+* **A Punição:** Se você esquecer de gritar UNO e ficar vulnerável com 1 carta, qualquer outro adversário na mesa pode clicar no botão de **"Pegar UNO"** contra você. O servidor aplicará a punição e você terá que **comprar 2 cartas de penalidade** imediatamente!
+* **Bloqueio Anti-Fraude:** O servidor impede que um jogador aplique a penalidade de UNO contra si mesmo (`UNO_SELF_CATCH`).
+
+### 👶 Proteção Infantil (Auto-UNO)
+Como o Uno KaWiHe é voltado para crianças e noites de jogos de família descontraídas, temos a **Proteção Automática de UNO (Kids Mode)**!
+* **Como ativar:** Abra as **Configurações (⚙️)** no menu e ligue a opção *"Proteção Anti-Esquecimento de UNO"*.
+* **O que ela faz:** Quando ativada, se uma criança ficar com 1 carta, o servidor grita UNO automaticamente para ela, protegendo as crianças pequenas de levarem punições indesejadas!
+
+---
+
+## 📊 7. Sistema de Pontuação de Carreira e Validação
+Ao final de cada partida, os pontos são computados e salvos permanentemente no seu perfil:
+* **Cartas Numéricas (0 a 9):** Valem o número estampado na carta (Ex: um 7 vale 7 pontos).
+* **Cartas Especiais (🚫, 🔄, ➕2):** Valem **20 pontos** cada.
+* **Coringas (🎨, ➕4):** Valem **50 pontos** cada.
+
+Suas vitórias totais e pontuação histórica são exibidas como troféus dourados no menu **"Troféus & Estatísticas"** da sua barra lateral! O motor de regras do Uno KaWiHe v2.2 é 100% testado por uma suíte de testes unitários automatizados (`Vitest`).
+
+---
+
+## 🎙️ 8. Como Liberar o Microfone no PC (Firefox & Chrome via HTTP/IP)
+
+Navegadores modernos exigem conexão segura (HTTPS) para liberar o microfone. Ao acessar o Uno KaWiHe diretamente pelo IP da sua VM em HTTP, o navegador bloqueia o microfone por padrão. Veja como liberar em poucos cliques:
+
+### 🦊 Como liberar no Firefox para PC
+1. Abra o **Firefox** no computador.
+2. Na barra de endereços (onde digita o nome dos sites), digite `about:config` e pressione Enter.
+3. O navegador exibirá um aviso de segurança. Clique no botão **"Aceitar o risco e continuar"**.
+4. No campo de busca localizado no topo da página, digite: `media.devices.insecure.enabled`
+5. O resultado aparecerá logo abaixo. Clique no botão de alternar (duas setas em direções opostas) no canto direito para mudar o valor de `false` para **`true`**.
+6. Em seguida, limpe a barra de pesquisa interna e busque por: `media.getusermedia.insecure.enabled`
+7. Da mesma forma, mude o valor dela de `false` para **`true`**.
+8. **Reinicie o Firefox** para garantir que as alterações façam efeito.
+
+### 🌐 O que fazer no Google Chrome do PC?
+Caso mude de ideia e queira aplicar no Chrome do computador, o passo a passo funciona perfeitamente:
+1. Acesse o endereço no Chrome: `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
+2. Mude a opção para **Enabled**.
+3. Digite o **IP ou URL** da sua VM/site no campo de texto exibido (ex: `http://SEU_IP:3000`).
+4. Clique no botão **Relaunch** no rodapé para reiniciar o Chrome.
+
+---
+
+## 🤝 9. Modo Duplas 2v2
+No modo **Duplas 2v2**, 4 jogadores formam duas equipes (**Equipe A** e **Equipe B**) em assentos alternados (`A1 → B1 → A2 → B2`):
+- **Visão de Parceiro:** Você consegue ver as cartas do seu parceiro de equipe na interface para planejar jogadas em conjunto, enquanto as cartas dos adversários continuam ocultas.
+- **Proteção de Equipe:** Não é possível acusar ou punir o próprio parceiro no botão de UNO.
+- **Vitória:** Assim que qualquer um dos dois parceiros bater (0 cartas), a dupla inteira vence a rodada e soma os pontos das cartas restantes na mão dos dois adversários.
+
+---
+
+## 🏆 10. Modo Torneios (Individual e Duplas)
+O Administrador pode organizar **Torneios** diretamente pelo menu **Torneios**:
+- **Modalidade Individual:** Distribui os inscritos em mesas de 2 a 4 jogadores. A classificação prioriza o número de vitórias; se houver empate na vaga de classificação, ocorre uma partida extra de desempate ou decisão administrativa.
+- **Modalidade Duplas 2v2:** Chaveamento eliminatório em séries **Melhor de 1 (Md1)**, **Melhor de 3 (Md3)** ou **Melhor de 5 (Md5)**, com avanço automático (*bye*) quando necessário.
+- **W.O. Automático:** Caso um jogador desconecte em torneio individual e não retorne dentro do prazo de tolerância, ele é removido da mesa por W.O. e a partida continua normalmente com os demais participantes.
+
+---
+
+## 🔐 11. Regras de Conta, Senha e Importação Administrativa
+- **Senha Mínima:** Todas as contas do Uno KaWiHe exigem senha com no mínimo **4 caracteres**.
+- **Nome de Exibição Único:** Cada jogador possui um Nome de Exibição (`displayName`) único no sistema para evitar confusão nas mesas.
+- **Contas Desativadas ou Arquivadas:** Administradores podem importar grupos de jogadores em lote e desativar/arquivar contas temporariamente sem apagar seus troféus ou históricos de torneios. Contas desativadas ou arquivadas têm login e conexão WebSocket bloqueados até serem reativadas.
+
+
