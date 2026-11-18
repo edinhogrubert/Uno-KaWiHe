@@ -16,7 +16,9 @@ import {
   ServerMessage,
   OpenRoomSummary,
   OnlinePlayersFilter,
-  OnlinePlayerSummary
+  OnlinePlayerSummary,
+  AdminAuditEntry,
+  UserAccountStatus
 } from './src/types/uno.js';
 import {
   createDeck,
@@ -51,7 +53,8 @@ import {
   updateUserProfile,
   adminCreateUser,
   adminResetPassword,
-  adminDeleteUser
+  adminDeleteUser,
+  setUsersStatus
 } from './server/authService.js';
 import { buildCsvTemplate } from './server/importParser.js';
 import {
@@ -1012,6 +1015,39 @@ app.get('/api/admin/vm-metrics', async (req, res) => {
 });
 
 // Get all users with online & room status
+const adminAuditLog: AdminAuditEntry[] = [];
+const MAX_ADMIN_AUDIT_ENTRIES = 120;
+
+function getAdminActorName(req: express.Request): string {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const caller = getUserFromToken(authHeader.split(' ')[1]);
+    if (caller) return caller.displayName || caller.username;
+  }
+  return 'Admin (PIN)';
+}
+
+function recordAdminAudit(req: express.Request, action: string, target: string, details?: string) {
+  adminAuditLog.unshift({
+    id: `audit_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: Date.now(),
+    adminName: getAdminActorName(req),
+    action,
+    target,
+    details,
+  });
+  if (adminAuditLog.length > MAX_ADMIN_AUDIT_ENTRIES) {
+    adminAuditLog.length = MAX_ADMIN_AUDIT_ENTRIES;
+  }
+}
+
+app.get('/api/admin/audit-log', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+  return res.json({ success: true, entries: adminAuditLog });
+});
+
 app.get('/api/admin/users', async (req, res) => {
   if (!isAdminRequest(req)) {
     return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
@@ -1084,7 +1120,13 @@ app.get('/api/admin/users', async (req, res) => {
       if (!isOnline) {
         for (const lp of lobbyList) {
           const lpName = String(lp.name || '').toLowerCase();
-          if (lp.id === u.id || lpName === uDisplayName || lpName === uUsername) {
+          if (
+            lp.id === u.id ||
+            lp.authenticatedUserId === u.id ||
+            (lp.userId && lp.userId.toLowerCase() === uUsername) ||
+            lpName === uDisplayName ||
+            lpName === uUsername
+          ) {
             isOnline = true;
             currentRoomId = lp.roomId || null;
             if (lp.roomId) {
@@ -1183,6 +1225,7 @@ app.post('/api/admin/users/create', async (req, res) => {
   if (!result.success) {
     return res.status(400).json(result);
   }
+  recordAdminAudit(req, 'USER_CREATE', `@${result.user?.username || body.username}`, body.isTemporary ? 'Conta temporária de torneio' : 'Conta padrão');
   return res.json(result);
 });
 
@@ -1215,7 +1258,54 @@ app.post('/api/admin/users/:id/reset-password', async (req, res) => {
   if (!result.success) {
     return res.status(400).json(result);
   }
+  recordAdminAudit(req, 'PASSWORD_RESET', req.params.id);
   return res.json(result);
+});
+
+// Admin: Update user status (active / disabled / archived)
+app.post('/api/admin/users/:id/status', async (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const targetId = String(req.params.id || '').trim();
+  const nextStatus = String(req.body?.status || '').trim() as UserAccountStatus;
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : undefined;
+
+  if (!['active', 'disabled', 'archived'].includes(nextStatus)) {
+    return res.status(400).json({ success: false, error: 'Status inválido. Use active, disabled ou archived.' });
+  }
+
+  const targetUser = getAllUsers().find(
+    (u) => u.id === targetId || u.username.toLowerCase() === targetId.toLowerCase()
+  );
+  if (!targetUser) {
+    return res.status(404).json({ success: false, error: 'Usuário não encontrado.' });
+  }
+
+  const outcome = await setUsersStatus([targetUser.id], nextStatus, reason);
+  if (outcome.skippedIds.includes(targetUser.id) || outcome.updatedIds.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'Não é permitido alterar o status de contas administrativas.',
+    });
+  }
+
+  if (nextStatus !== 'active') {
+    disconnectUsersFromServer(
+      [targetUser.id],
+      reason || 'Esta conta foi desativada ou arquivada pelo Administrador.'
+    );
+  }
+
+  const label = nextStatus === 'active' ? 'reativada' : nextStatus === 'disabled' ? 'desativada' : 'arquivada';
+  recordAdminAudit(req, `USER_STATUS_${nextStatus.toUpperCase()}`, `@${targetUser.username}`, reason || `Conta ${label}`);
+
+  return res.json({
+    success: true,
+    status: nextStatus,
+    message: `Conta @${targetUser.username} ${label} com sucesso.`,
+  });
 });
 
 // Admin: Delete user
@@ -1247,6 +1337,7 @@ app.delete('/api/admin/users/:id', async (req, res) => {
   if (result.deletedUserId) {
     disconnectUsersFromServer([result.deletedUserId], 'Esta conta foi removida pelo Administrador.');
   }
+  recordAdminAudit(req, 'USER_DELETE', req.params.id);
   return res.json(result);
 });
 
@@ -1277,6 +1368,7 @@ app.post('/api/admin/rooms/:id/message', (req, res) => {
 
   broadcastToRoom(room.id, { type: 'chat_message', message: chatMsg });
   broadcastLog(room, `💬 ${sender}: ${text.trim()}`, 'chat', sender);
+  recordAdminAudit(req, 'ROOM_MESSAGE', `Sala #${room.id}`, text.trim().slice(0, 80));
 
   return res.json({ success: true, message: `Mensagem transmitida para a Sala #${room.id} com sucesso!` });
 });
@@ -1293,6 +1385,11 @@ app.get('/api/admin/rooms', (req, res) => {
       playersCount: r.players.length,
       maxPlayers: r.settings.maxPlayers,
       turnDuration: r.settings.turnDuration,
+      gameMode: r.settings.gameMode || 'standard',
+      kidsMode: !!(r.settings.showBotCards || r.settings.autoUnoProtection),
+      isPrivate: !!r.settings.isPrivate,
+      isTournament: !!r.tournamentId,
+      spectatorsCount: r.spectators?.filter((s) => s.isConnected).length || 0,
       roundTurnCount: r.roundTurnCount || 0,
       players: r.players.map((p) => ({
         id: p.id,
@@ -1312,6 +1409,36 @@ app.get('/api/admin/rooms', (req, res) => {
   }
 });
 
+app.post('/api/admin/rooms/cleanup-empty', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
+  }
+
+  const closedRoomIds: string[] = [];
+  for (const room of Array.from(rooms.values())) {
+    if (room.tournamentId) continue;
+    const connectedHumans = room.players.filter((p) => !p.isBot && p.isConnected).length;
+    if (connectedHumans === 0) {
+      closedRoomIds.push(room.id);
+      cleanupRoomResources(room);
+    }
+  }
+
+  if (closedRoomIds.length > 0) {
+    recordAdminAudit(req, 'ROOMS_CLEANUP_EMPTY', `${closedRoomIds.length} sala(s)`, closedRoomIds.join(', '));
+  }
+
+  return res.json({
+    success: true,
+    closedCount: closedRoomIds.length,
+    closedRoomIds,
+    message:
+      closedRoomIds.length > 0
+        ? `${closedRoomIds.length} sala(s) sem jogadores humanos encerrada(s).`
+        : 'Nenhuma sala vazia ou apenas com bots para limpar.',
+  });
+});
+
 app.post('/api/admin/rooms/:id/close', (req, res) => {
   if (!isAdminRequest(req)) {
     return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
@@ -1325,6 +1452,7 @@ app.post('/api/admin/rooms/:id/close', (req, res) => {
   const reason = req.body.reason || 'Esta sala foi encerrada pelo Administrador Edinho.';
   broadcastToRoom(room.id, { type: 'player_kicked', reason });
   cleanupRoomResources(room);
+  recordAdminAudit(req, 'ROOM_CLOSE', `Sala #${room.id}`);
 
   return res.json({ success: true, message: `Sala ${room.id} fechada com sucesso.` });
 });
@@ -1360,6 +1488,7 @@ app.post('/api/admin/rooms/:id/kick', (req, res) => {
 
   broadcastLog(room, `🚫 ${removed.name} foi expulso da sala pelo Administrador.`, 'system');
   syncRoomState(room);
+  recordAdminAudit(req, 'ROOM_KICK', removed.name, `Sala #${room.id}`);
 
   return res.json({ success: true, message: `${removed.name} foi expulso com sucesso.` });
 });
@@ -1385,6 +1514,15 @@ app.post('/api/admin/broadcast', (req, res) => {
     broadcastToRoom(room.id, announcement);
     broadcastLog(room, `📢 [AVISO GLOBAL]: ${message.trim()}`, 'system', sender);
   });
+
+  // Also send to all online lobby clients not in rooms
+  for (const [ws, meta] of onlinePlayers.entries()) {
+    if (!meta.inRoom && ws.readyState === WebSocket.OPEN) {
+      safeWsSend(ws, JSON.stringify(announcement));
+    }
+  }
+
+  recordAdminAudit(req, 'GLOBAL_BROADCAST', 'Todas as Salas + Lobby', message.trim().slice(0, 80));
 
   return res.json({ success: true, message: 'Aviso global transmitido a todas as salas com sucesso.' });
 });
@@ -1514,6 +1652,7 @@ app.get('/api/admin/player-report/:target', async (req, res) => {
       tag: matchedUser?.tag || matchedMeta?.tag || '#0000',
       createdAt: matchedUser?.createdAt,
       isRegistered: !!matchedUser,
+      status: matchedUser ? getEffectiveUserStatus(matchedUser) : 'active',
     },
     presence: {
       isOnline: !!matchedMeta && (!targetWs || targetWs.readyState === WebSocket.OPEN),
@@ -1564,6 +1703,45 @@ app.get('/api/admin/player-report/:target', async (req, res) => {
   return res.json({ success: true, report });
 });
 
+function matchesAdminTargetMeta(
+  meta: OnlinePlayerSession,
+  targetId: string,
+  matchedUser?: ReturnType<typeof getAllUsers>[number] | null
+): boolean {
+  const targetLower = targetId.trim().toLowerCase();
+  if (
+    meta.id === targetId ||
+    meta.authenticatedUserId === targetId ||
+    (meta.userId && meta.userId.toLowerCase() === targetLower) ||
+    meta.name.toLowerCase() === targetLower
+  ) {
+    return true;
+  }
+  if (matchedUser) {
+    if (
+      meta.authenticatedUserId === matchedUser.id ||
+      meta.id === `user-${matchedUser.username}` ||
+      (meta.userId && meta.userId.toLowerCase() === matchedUser.username.toLowerCase()) ||
+      meta.name.toLowerCase() === matchedUser.displayName.toLowerCase()
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findUserForAdminAction(targetId: string) {
+  const targetLower = targetId.trim().toLowerCase();
+  return (
+    getAllUsers().find(
+      (u) =>
+        u.id === targetId ||
+        u.username.toLowerCase() === targetLower ||
+        u.displayName.toLowerCase() === targetLower
+    ) || null
+  );
+}
+
 // Admin: Disconnect Player WebSocket
 app.post('/api/admin/player-action/disconnect', (req, res) => {
   if (!isAdminRequest(req)) {
@@ -1572,9 +1750,10 @@ app.post('/api/admin/player-action/disconnect', (req, res) => {
   const { targetId, reason = 'Você foi desconectado pelo Administrador.' } = req.body;
   if (!targetId) return res.status(400).json({ success: false, error: 'ID do jogador obrigatório.' });
 
+  const matchedUser = findUserForAdminAction(String(targetId));
   let disconnected = false;
-  for (const [ws, meta] of onlinePlayers.entries()) {
-    if (meta.id === targetId || meta.userId === targetId || meta.name === targetId) {
+  for (const [ws, meta] of Array.from(onlinePlayers.entries())) {
+    if (matchesAdminTargetMeta(meta, String(targetId), matchedUser)) {
       if (ws.readyState === WebSocket.OPEN) {
         try {
           ws.send(JSON.stringify({ type: 'error', message: `⚠️ ${reason}` }));
@@ -1583,10 +1762,12 @@ app.post('/api/admin/player-action/disconnect', (req, res) => {
       }
       onlinePlayers.delete(ws);
       disconnected = true;
-      break;
     }
   }
 
+  if (disconnected) {
+    recordAdminAudit(req, 'PLAYER_DISCONNECT', matchedUser ? `@${matchedUser.username}` : String(targetId), reason);
+  }
   scheduleBroadcastOnlinePlayers();
   return res.json({
     success: true,
@@ -1600,12 +1781,27 @@ app.post('/api/admin/player-action/kick-room', (req, res) => {
     return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
   }
   const { targetId, roomId, reason = 'Você foi retirado da sala pelo Administrador.' } = req.body;
+  if (!targetId) return res.status(400).json({ success: false, error: 'ID do jogador obrigatório.' });
+
+  const targetStr = String(targetId).trim();
+  const targetLower = targetStr.toLowerCase();
+  const matchedUser = findUserForAdminAction(targetStr);
+
+  const matchesRoomPlayer = (p: InternalPlayer) =>
+    p.id === targetStr ||
+    p.name.toLowerCase() === targetLower ||
+    (matchedUser &&
+      (p.id === `user-${matchedUser.username}` ||
+        p.id === matchedUser.id ||
+        p.name.toLowerCase() === matchedUser.displayName.toLowerCase() ||
+        p.name.toLowerCase() === matchedUser.username.toLowerCase()));
+
   let targetRoom: RoomData | undefined;
   if (roomId) {
-    targetRoom = rooms.get(roomId.toUpperCase());
+    targetRoom = rooms.get(String(roomId).toUpperCase());
   } else {
     for (const r of rooms.values()) {
-      if (r.players.some((p) => p.id === targetId || p.name === targetId)) {
+      if (r.players.some(matchesRoomPlayer)) {
         targetRoom = r;
         break;
       }
@@ -1616,7 +1812,7 @@ app.post('/api/admin/player-action/kick-room', (req, res) => {
     return res.status(404).json({ success: false, error: 'Sala ou jogador não encontrado.' });
   }
 
-  const pIdx = targetRoom.players.findIndex((p) => p.id === targetId || p.name === targetId);
+  const pIdx = targetRoom.players.findIndex(matchesRoomPlayer);
   if (pIdx === -1) {
     return res.status(404).json({ success: false, error: 'Jogador não está nesta sala.' });
   }
@@ -1641,6 +1837,7 @@ app.post('/api/admin/player-action/kick-room', (req, res) => {
   broadcastLog(targetRoom, `🚫 ${removed.name} foi retirado da sala pelo Administrador.`, 'system');
   syncRoomState(targetRoom);
   scheduleBroadcastOnlinePlayers();
+  recordAdminAudit(req, 'PLAYER_KICK_ROOM', removed.name, `Sala #${targetRoom.id}`);
 
   return res.json({ success: true, message: `${removed.name} foi retirado da sala com sucesso.` });
 });
@@ -1651,13 +1848,17 @@ app.post('/api/admin/player-action/alert', (req, res) => {
     return res.status(403).json({ success: false, error: 'Acesso restrito ao Administrador.' });
   }
   const { targetId, message } = req.body;
+  if (!targetId) {
+    return res.status(400).json({ success: false, error: 'ID do jogador obrigatório.' });
+  }
   if (!message || !message.trim()) {
     return res.status(400).json({ success: false, error: 'Mensagem obrigatória.' });
   }
 
-  let sent = false;
+  const matchedUser = findUserForAdminAction(String(targetId));
+  let sentCount = 0;
   for (const [ws, meta] of onlinePlayers.entries()) {
-    if (meta.id === targetId || meta.userId === targetId || meta.name === targetId) {
+    if (matchesAdminTargetMeta(meta, String(targetId), matchedUser)) {
       if (ws.readyState === WebSocket.OPEN) {
         try {
           ws.send(
@@ -1668,16 +1869,24 @@ app.post('/api/admin/player-action/alert', (req, res) => {
               timestamp: Date.now(),
             })
           );
-          sent = true;
+          sentCount += 1;
         } catch {}
       }
-      break;
     }
   }
 
+  if (sentCount === 0) {
+    return res.status(404).json({
+      success: false,
+      error: 'Jogador offline ou sem conexão WebSocket ativa no momento.',
+    });
+  }
+
+  recordAdminAudit(req, 'PLAYER_ALERT', matchedUser ? `@${matchedUser.username}` : String(targetId), message.trim().slice(0, 80));
+
   return res.json({
     success: true,
-    message: sent ? 'Alerta enviado diretamente na tela do jogador!' : 'Jogador offline ou não encontrado.',
+    message: `Alerta enviado diretamente na tela do jogador!`,
   });
 });
 

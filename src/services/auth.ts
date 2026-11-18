@@ -2,6 +2,7 @@ import {
   AuthResponse,
   UserProfile,
   UserRole,
+  UserAccountStatus,
   InviteCode,
   ImportBatch,
   ImportBatchDetailUser,
@@ -344,6 +345,30 @@ class AuthService {
         headers: {
           Authorization: `Bearer ${this.token}`,
         },
+      });
+      const parsed = await parseJsonSafe<{ success: boolean; message?: string; error?: string }>(res);
+      if (!parsed.isJson || !parsed.data) {
+        return { success: false, error: parsed.error || 'Erro ao conectar com o servidor.' };
+      }
+      return parsed.data;
+    } catch {
+      return { success: false, error: 'Erro ao conectar com o servidor.' };
+    }
+  }
+
+  public async adminSetUserStatus(
+    userId: string,
+    status: UserAccountStatus,
+    reason?: string
+  ): Promise<{ success: boolean; message?: string; error?: string }> {
+    try {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/status`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({ status, reason }),
       });
       const parsed = await parseJsonSafe<{ success: boolean; message?: string; error?: string }>(res);
       if (!parsed.isJson || !parsed.data) {

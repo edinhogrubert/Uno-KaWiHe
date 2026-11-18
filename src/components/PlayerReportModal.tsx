@@ -35,6 +35,7 @@ interface PlayerReportModalProps {
   currentUser: UserProfile | null;
   onJoinRoomAsAdmin?: (roomId: string) => void;
   onWatchRoom?: (roomId: string, revealCards?: boolean) => void;
+  onActionCompleted?: () => void;
 }
 
 export const PlayerReportModal: React.FC<PlayerReportModalProps> = ({
@@ -43,7 +44,8 @@ export const PlayerReportModal: React.FC<PlayerReportModalProps> = ({
   targetPlayer,
   currentUser,
   onJoinRoomAsAdmin,
-  onWatchRoom
+  onWatchRoom,
+  onActionCompleted
 }) => {
   const [report, setReport] = useState<PlayerReportData | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -57,6 +59,7 @@ export const PlayerReportModal: React.FC<PlayerReportModalProps> = ({
   const [isResetPassOpen, setIsResetPassOpen] = useState(false);
   const [newPassword, setNewPassword] = useState('');
   const [isCopied, setIsCopied] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<'disconnect' | 'kick' | 'toggle_status' | null>(null);
 
   useEffect(() => {
     if (!isOpen || !targetPlayer) {
@@ -111,9 +114,7 @@ export const PlayerReportModal: React.FC<PlayerReportModalProps> = ({
 
   const handleDisconnectPlayer = async () => {
     if (!report) return;
-    const confirmed = window.confirm(`Deseja realmente desconectar a sessão de ${report.user.displayName}?`);
-    if (!confirmed) return;
-
+    setConfirmAction(null);
     setActionSuccess(null);
     setActionError(null);
 
@@ -130,6 +131,7 @@ export const PlayerReportModal: React.FC<PlayerReportModalProps> = ({
       if (parsed.ok && parsed.isJson && parsed.data?.success) {
         setActionSuccess(parsed.data.message || 'Sessão encerrada.');
         fetchPlayerReport();
+        onActionCompleted?.();
       } else {
         setActionError(parsed.error || 'Erro ao desconectar jogador.');
       }
@@ -140,9 +142,7 @@ export const PlayerReportModal: React.FC<PlayerReportModalProps> = ({
 
   const handleKickFromRoom = async () => {
     if (!report || !report.location.roomId) return;
-    const confirmed = window.confirm(`Expulsar ${report.user.displayName} da Sala #${report.location.roomId}?`);
-    if (!confirmed) return;
-
+    setConfirmAction(null);
     setActionSuccess(null);
     setActionError(null);
 
@@ -160,11 +160,33 @@ export const PlayerReportModal: React.FC<PlayerReportModalProps> = ({
       if (parsed.ok && parsed.isJson && parsed.data?.success) {
         setActionSuccess(parsed.data.message || 'Jogador expulso da sala.');
         fetchPlayerReport();
+        onActionCompleted?.();
       } else {
         setActionError(parsed.error || 'Erro ao expulsar jogador da sala.');
       }
     } catch {
       setActionError('Erro de conexão ao tentar expulsar jogador.');
+    }
+  };
+
+  const handleToggleUserStatus = async () => {
+    if (!report || !report.user.isRegistered) return;
+    setConfirmAction(null);
+    setActionSuccess(null);
+    setActionError(null);
+
+    const nextStatus = report.user.status === 'disabled' || report.user.status === 'archived' ? 'active' : 'disabled';
+    const res = await auth.adminSetUserStatus(
+      report.user.id,
+      nextStatus,
+      nextStatus === 'disabled' ? 'Conta desativada via Relatório Administrativo.' : undefined
+    );
+    if (res.success) {
+      setActionSuccess(res.message || 'Status da conta atualizado.');
+      fetchPlayerReport();
+      onActionCompleted?.();
+    } else {
+      setActionError(res.error || 'Erro ao alterar status da conta.');
     }
   };
 
@@ -300,7 +322,7 @@ ${report.location.inRoom ? `👥 Membros na mesa: ${report.location.members.map(
   const roomId = report ? report.location.roomId : (targetPlayer as any)?.roomId;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/75 backdrop-blur-md animate-in fade-in duration-200">
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-3 sm:p-4 bg-slate-950/75 backdrop-blur-md animate-in fade-in duration-200">
       <div className="relative w-full max-w-2xl bg-white border-2 border-slate-200 rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
         {/* Top Header Bar */}
         <div className="bg-gradient-to-r from-slate-900 via-sky-950 to-indigo-950 text-white px-5 py-4 flex items-center justify-between border-b border-white/10 shrink-0">
@@ -397,6 +419,16 @@ ${report.location.inRoom ? `👥 Membros na mesa: ${report.location.members.map(
                     <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 border border-sky-300 flex items-center gap-1">
                       <User className="w-3 h-3 text-sky-600" />
                       Jogador
+                    </span>
+                  )}
+                  {report?.user.status === 'disabled' && (
+                    <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 border border-rose-300">
+                      Desativada
+                    </span>
+                  )}
+                  {report?.user.status === 'archived' && (
+                    <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-slate-200 text-slate-700 border border-slate-300">
+                      Arquivada
                     </span>
                   )}
                 </div>
@@ -751,6 +783,40 @@ ${report.location.inRoom ? `👥 Membros na mesa: ${report.location.members.map(
               </form>
             )}
 
+            {/* Inline Confirmation Banner */}
+            {confirmAction && (
+              <div className="mb-3 p-3 bg-rose-50 border border-rose-300 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-2 animate-in fade-in">
+                <span className="text-xs font-bold text-rose-900">
+                  {confirmAction === 'disconnect' && `Deseja desconectar a sessão de ${displayName}?`}
+                  {confirmAction === 'kick' && `Expulsar ${displayName} da Sala #${roomId}?`}
+                  {confirmAction === 'toggle_status' &&
+                    (report?.user.status === 'disabled' || report?.user.status === 'archived'
+                      ? `Reativar a conta de ${displayName}?`
+                      : `Desativar a conta de ${displayName} e desconectar sessões ativas?`)}
+                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmAction(null)}
+                    className="px-3 py-1 rounded-lg border border-slate-200 bg-white text-xs font-bold text-slate-600 hover:bg-slate-100 cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (confirmAction === 'disconnect') handleDisconnectPlayer();
+                      else if (confirmAction === 'kick') handleKickFromRoom();
+                      else if (confirmAction === 'toggle_status') handleToggleUserStatus();
+                    }}
+                    className="px-3 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold cursor-pointer"
+                  >
+                    Confirmar
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
@@ -764,7 +830,7 @@ ${report.location.inRoom ? `👥 Membros na mesa: ${report.location.members.map(
               {inRoom && (
                 <button
                   type="button"
-                  onClick={handleKickFromRoom}
+                  onClick={() => setConfirmAction('kick')}
                   className="px-3 py-2 rounded-xl bg-white hover:bg-red-50 border border-red-300 text-red-800 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
                 >
                   <UserX className="w-3.5 h-3.5 text-red-600" />
@@ -774,7 +840,7 @@ ${report.location.inRoom ? `👥 Membros na mesa: ${report.location.members.map(
 
               <button
                 type="button"
-                onClick={handleDisconnectPlayer}
+                onClick={() => setConfirmAction('disconnect')}
                 className="px-3 py-2 rounded-xl bg-white hover:bg-red-50 border border-red-300 text-red-800 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
               >
                 <LogOut className="w-3.5 h-3.5 text-red-600" />
@@ -789,6 +855,23 @@ ${report.location.inRoom ? `👥 Membros na mesa: ${report.location.members.map(
                 >
                   <Key className="w-3.5 h-3.5 text-blue-600" />
                   Redefinir Senha
+                </button>
+              )}
+
+              {report?.user.isRegistered && report.user.role !== 'admin' && report.user.username.toLowerCase() !== 'edinho' && (
+                <button
+                  type="button"
+                  onClick={() => setConfirmAction('toggle_status')}
+                  className={`px-3 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    report.user.status === 'disabled' || report.user.status === 'archived'
+                      ? 'bg-emerald-50 hover:bg-emerald-100 border-emerald-300 text-emerald-900'
+                      : 'bg-white hover:bg-rose-50 border-rose-300 text-rose-800'
+                  }`}
+                >
+                  <Shield className="w-3.5 h-3.5" />
+                  {report.user.status === 'disabled' || report.user.status === 'archived'
+                    ? 'Reativar Conta'
+                    : 'Desativar Conta'}
                 </button>
               )}
             </div>

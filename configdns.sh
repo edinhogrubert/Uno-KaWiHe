@@ -39,14 +39,14 @@ log_info "IP Público detectado da VM: ${PUBLIC_IP:-Não foi possível detectar 
 
 # Solicitar ou carregar credenciais DuckDNS
 echo ""
-read -p "Digite o seu subdomínio DuckDNS completo (ex: uno.grubert.duckdns.org ou apenas uno se for grubert): " INPUT_DOMAIN
+read -p "Digite o domínio DuckDNS completo (ex: uno.grubert.duckdns.org): " INPUT_DOMAIN
 
 if [[ -z "$INPUT_DOMAIN" ]]; then
   log_err "Domínio não pode estar vazio."
   exit 1
 fi
 
-# Se o usuário digitou apenas o prefixo (ex: uno), completar com .duckdns.org se não tiver ponto
+# Se o usuário digitou apenas o prefixo sem ponto, completar com .duckdns.org
 if [[ "$INPUT_DOMAIN" != *"."* ]]; then
   FULL_DOMAIN="${INPUT_DOMAIN}.duckdns.org"
 else
@@ -97,29 +97,14 @@ else
 fi
 
 # Criar configuração do Caddyfile para o domínio do usuário
-LOG_DIR="/var/log/caddy"
-mkdir -p "$LOG_DIR"
-chown -R caddy:caddy "$LOG_DIR" 2>/dev/null || true
-
 CADDYFILE_PATH="/etc/caddy/Caddyfile"
 log_info "Escrevendo configuração do Caddy em $CADDYFILE_PATH..."
 
 cat > "$CADDYFILE_PATH" <<EOF
 ${FULL_DOMAIN} {
-    # Proxy reverso para o Uno KaWiHe na porta 3000
-    # Suporta HTTP, HTTPS, WebSockets (WSS) e headers de IP real automaticamente
-    reverse_proxy 127.0.0.1:3000 {
-        header_up Host {host}
-        header_up X-Real-IP {remote}
-        header_up X-Forwarded-For {remote}
-        header_up X-Forwarded-Proto {scheme}
-    }
-
-    # Logs de acesso e erro
-    log {
-        output file ${LOG_DIR}/access.log
-        format console
-    }
+	# Proxy reverso para o Uno KaWiHe na porta 3000
+	# Suporta HTTP, HTTPS, WebSockets (WSS) e headers de IP real automaticamente
+	reverse_proxy 127.0.0.1:3000
 }
 EOF
 
@@ -139,12 +124,20 @@ fi
 
 # Testar e reiniciar Caddy
 log_info "Testando configuração do Caddy..."
+caddy fmt --overwrite "$CADDYFILE_PATH"
 caddy validate --config "$CADDYFILE_PATH"
 
 log_info "Reiniciando serviço Caddy..."
 systemctl daemon-reload
 systemctl enable caddy
 systemctl restart caddy
+
+sleep 2
+if ! systemctl is-active --quiet caddy; then
+  log_err "O serviço Caddy falhou ao iniciar! Veja os logs:"
+  journalctl -u caddy -n 20 --no-pager || true
+  exit 1
+fi
 
 echo ""
 echo "===================================================================="
@@ -154,5 +147,5 @@ echo "🌐 Seu jogo agora está seguro e acessível publicamente em:"
 echo "   👉 https://${FULL_DOMAIN}"
 echo ""
 echo "🔒 O Caddy está gerando/renovando o certificado SSL Let's Encrypt"
-echo "   e fazendo proxy reverso para http://localhost:3000 (com WebSockets)."
+echo "   e fazendo proxy reverso para http://127.0.0.1:3000 (com WebSockets)."
 echo "===================================================================="

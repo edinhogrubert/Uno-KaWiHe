@@ -278,6 +278,7 @@ export interface PlayerReportData {
     tag: string;
     createdAt?: string;
     isRegistered: boolean;
+    status?: UserAccountStatus;
   };
   presence: {
     isOnline: boolean;
@@ -340,6 +341,11 @@ export interface AdminRoomSummary {
   playersCount: number;
   maxPlayers: number;
   turnDuration: number;
+  gameMode?: GameMode;
+  kidsMode?: boolean;
+  isPrivate?: boolean;
+  isTournament?: boolean;
+  spectatorsCount?: number;
   players: Array<{
     id: string;
     name: string;
@@ -386,6 +392,15 @@ export interface AdminUserSummary {
   isOnline: boolean;
   currentRoomId?: string | null;
   roomStatus?: string | null;
+}
+
+export interface AdminAuditEntry {
+  id: string;
+  timestamp: number;
+  adminName: string;
+  action: string;
+  target: string;
+  details?: string;
 }
 
 export interface VoicePeerState {

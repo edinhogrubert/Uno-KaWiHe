@@ -470,7 +470,12 @@ export default function App() {
         } else if (msg.type === 'global_announcement') {
           setGlobalAnnouncement({ message: msg.message, sender: msg.sender });
           sound.unoCall();
-          setTimeout(() => setGlobalAnnouncement(null), 7000);
+          const duration = msg.message?.includes('Mensagem do Administrador') ? 15000 : 7000;
+          setTimeout(() => {
+            setGlobalAnnouncement((prev) =>
+              prev && prev.message === msg.message && prev.sender === msg.sender ? null : prev
+            );
+          }, duration);
         } else if (msg.type === 'lobby_online_players') {
           setOnlinePlayers(msg.players);
           setOnlinePlayersMeta({
@@ -973,6 +978,14 @@ export default function App() {
         currentUser={currentUser}
         initialTab={adminModalTab}
         ws={wsRef.current}
+        onJoinRoomAsAdmin={(targetRoomId) => {
+          handleJoinRoom(
+            targetRoomId,
+            currentUser?.displayName || 'Admin Edinho',
+            currentUser?.avatar || '👑',
+            false
+          );
+        }}
         onWatchRoom={(targetRoomId, revealCards) => {
           handleJoinRoom(
             targetRoomId,
@@ -1003,7 +1016,7 @@ export default function App() {
 
       {/* Global Server Announcement Banner */}
       {globalAnnouncement && (
-        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-lg w-[90%] bg-gradient-to-r from-amber-500 via-yellow-400 to-amber-500 text-slate-950 p-4 rounded-3xl shadow-2xl border-4 border-white animate-in slide-in-from-top-4 duration-300 flex items-start gap-3">
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[90] max-w-lg w-[90%] bg-gradient-to-r from-amber-500 via-yellow-400 to-amber-500 text-slate-950 p-4 rounded-3xl shadow-2xl border-4 border-white animate-in slide-in-from-top-4 duration-300 flex items-start gap-3">
           <div className="text-2xl shrink-0">📢</div>
           <div className="flex-1">
             <div className="text-[11px] font-black uppercase tracking-wider text-amber-950">
