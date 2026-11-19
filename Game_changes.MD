@@ -1,6 +1,6 @@
-# 📑 GAME_CHANGES.MD — TRANSIÇÃO E EVOLUÇÃO UNO KAWIHE v2.2.3
+# 📑 GAME_CHANGES.MD — TRANSIÇÃO E EVOLUÇÃO UNO KAWIHE v2.3.0
 
-Este documento descreve a auditoria técnica, tabela de comportamentos observados (comparando v2.1 x v2.2+), correções de segurança aplicadas, soluções de cada etapa e matriz de testes do **Uno KaWiHe v2.2.3**.
+Este documento descreve a auditoria técnica, tabela de comportamentos observados (comparando v2.1 x v2.2+ x v2.3.0), correções de segurança aplicadas, soluções de cada etapa e matriz de testes do **Uno KaWiHe v2.3.0**.
 
 ---
 
@@ -110,11 +110,25 @@ Este documento descreve a auditoria técnica, tabela de comportamentos observado
      - **WAL State Machine (`importService.ts` + `src/types/uno.ts` + `AdminImportHistoryPanel.tsx`):** Consolidação dos estados `'running' | 'completed' | 'failed' | 'partial' | 'reconciling'`, checkpoint intermediário `usersSaved`, rastreabilidade `createdByImportBatchId` / `createdByImportOperationId`, telemetria por operação (`userOpStatus`, `enrollOpStatus`) e correção do estado sequencial de torneio em `reconcileIncompleteImportBatches`.
      - **Simulador & Testes Reais (`scripts/tournament-test.mjs` + `tests/`):** Adequação do simulador para exigir JWT real (`--password` / `--token`) sem quebrar `scripts/capacity-test.mjs`, proteção `startedGameIds`/`--max-wait-ms` e suporte multi-espectador; reescrita real de `tests/tournamentStress.test.ts` (Individual 8/16/32 e Duplas Md3 4/8) e ampliação de `tests/importService.test.ts` (**109 testes em 9 suítes**).
 
+### 13. **Passo 13: Ciclo de Vida Administrativo de Torneios & Limpeza Segura de Temporários (124 Testes) [CONCLUÍDO]**
+   - **O que foi feito para resolver:**
+     - Criação de `server/tournamentCleanupService.ts` com endpoints protegidos por JWT admin para reagendamento (`rescheduled`), encerramento seguro (`closed`, bloqueado se houver mesa ativa e preservando histórico/usuários) e auditoria por torneio.
+     - Implementação de exclusão isolada de usuários temporários com proveniência explícita (`accountOriginType === 'tournament_temporary' && isTemporary && temporaryTournamentId`), verificação de dependências externas, desafio matemático de uso único validado no servidor e rollback atômico.
+     - Adição de `tests/participationLogic.test.ts` (9 testes) e `tests/tournamentAdminLifecycle.test.ts` (6 testes), elevando a suíte para **124 testes em 11 arquivos**.
+
+### 14. **Passo 14: Versionamento Visível (`v2.3.0`), Desconexão Real de Sessão (`sessionVersion`), Painel Central Admin & `configdns.sh` (126 Testes) [CONCLUÍDO]**
+   - **O que foi feito para resolver:**
+     - **Desconexão Real de Sessão pelo Admin:** Adição de `sessionVersion` no `UserRecord` e na claim `sv` do JWT (`server/authService.ts` e `auth-service/server.ts`). Ao desconectar um jogador pelo admin, o servidor incrementa `sessionVersion`, envia `session_revoked`, fecha o WebSocket com código `4001`, limpa a sessão do navegador sem reconexão automática (`App.tsx`) e impede entrada/criação de salas para tokens revogados.
+     - **Mensagens Diretas & Painel Central Admin:** Entrega direta por `authenticatedUserId` com banner global `z-[90]` e aviso se offline; clique em qualquer usuário nas abas *Salas* ou *Usuários* abre `PlayerReportModal`; inclusão de filtros rápidos, suspensão/reativação inline, limpeza de salas sem humanos e correção do mapeamento de `/api/admin/vm-metrics` na aba *Sistema & Auditoria*.
+     - **Versionamento Visível & Deploy Verificado (`v2.3.0`):** Fonte única em `src/utils/versionHistory.ts`, endpoint `GET /api/version`, `ChangelogModal.tsx` com detecção de divergência Cliente × Servidor, selos clicáveis em `LoginScreen`, `Lobby` e `AdminRoomsModal`, e verificação automática de versão na Etapa 6 do `deploy.sh`.
+     - **Infraestrutura & DNS HTTPS:** Migração oficial do `deploy.sh` para `edinhogrubert/Uno-KaWiHe` e criação do `configdns.sh` (DuckDNS + Caddy SSL).
+     - **Expansão da Suíte para 126 Testes:** Criação de `tests/sessionRevocation.test.ts` (2 testes), totalizando **126 testes em 12 suítes**.
+
 ---
 
-## ⚠️ Divergências Conhecidas & Pendências Pós-Deploy
+## ⚠️ Divergências Conhecidas & Melhorias Futuras (Pós-v2.3.0)
 
-Estas pendências foram mapeadas e registradas. Nenhuma delas impede o deploy da v2.2, servindo como roteiro de melhorias para a v2.3:
+Estas melhorias permanecem mapeadas como backlog opcional e não impedem a operação em produção da v2.3.0:
 
 1. **Jogador caído na sua vez sem limite de tempo (`turnTimeLimit = 0`):**
    - *Situação:* Se o tempo de turno for ilimitado e o jogador desconectar, o jogo aguarda sua reconexão.

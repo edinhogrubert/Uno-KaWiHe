@@ -1,7 +1,7 @@
-UNO KAWIHE v2.2 — CONTRATO TÉCNICO, DE COMPORTAMENTO E IMPLEMENTAÇÃO
+UNO KAWIHE v2.3.0 — CONTRATO TÉCNICO, DE COMPORTAMENTO E IMPLEMENTAÇÃO
 
-Status: Especificação normativa
-Base: Uno KaWiHe v2.1
+Status: Especificação normativa (Base v2.2 -> v2.3.0)
+Base: Uno KaWiHe v2.1 / v2.2
 Objetivo: servir como contrato completo para análise, correção, evolução e reconstrução do sistema existente.
 
     Regra fundamental: o código atualmente existente (unoEngine.ts, server.ts, authService.ts, voiceChat.ts e demais arquivos relevantes) deve ser inspecionado antes de qualquer alteração. Quando o comportamento real do código divergir deste documento, o agente de implementação deverá identificar a divergência e determinar, com base no objetivo de preservação do sistema, se deve atualizar o código ou ajustar a especificação. Nenhuma decisão importante deve ser tomada apenas por inferência.
@@ -938,9 +938,9 @@ Normalização:
 
     comparação case-insensitive.
 
-Comprimento proposto:
+Comprimento implementado:
 
-2–16 caracteres
+2–18 caracteres (constantes `MIN_DISPLAY_NAME_LENGTH` e `MAX_DISPLAY_NAME_LENGTH` em `server/authService.ts`)
 
 A mesma normalização deve ser utilizada:
 
@@ -1489,25 +1489,26 @@ A única instrução processual que eu manteria é esta:
 
     Antes de alterar o código, faça uma auditoria do comportamento existente e compare-o com a v2.2. Não assuma que os valores marcados como proposta correspondem ao comportamento atual.
 
-65. Relatório de Diagnóstico de Jogadores e Moderação (Admin)
+65. Relatório de Diagnóstico de Jogadores, Painel Central e Moderação (Admin)
 
-O sistema v2.2 introduz rotas administrativas avançadas para inspeção de usuários conectados:
-- `/api/admin/player-report/:target`: Retorna objeto estruturado contendo dados da conta (`user`), presença em tempo real (`presence` com IP, dispositivo, navegador e tempo conectado), localização na sala atual (`location` com membros da mesa, ID e status) e estatísticas históricas (`stats`).
+O sistema disponibiliza rotas administrativas protegidas por JWT (`role === 'admin'`) para inspeção e controle em tempo real:
+- `/api/admin/player-report/:target`: Retorna objeto estruturado contendo dados da conta (`user`), presença em tempo real (`presence` com IP, dispositivo, navegador e tempo conectado), localização na sala atual (`location` com membros da mesa, ID e status) e estatísticas históricas (`stats`). Acessível ao clicar sobre qualquer jogador no Lobby ou nas abas *Salas* e *Usuários* do Painel Central Admin (`AdminRoomsModal`).
 - Ações administrativas protegidas por JWT (`role === 'admin'`):
   - Expulsar da sala (`/api/admin/player-action/kick-room`)
-  - Desconectar sessão WebSocket (`/api/admin/player-action/disconnect`)
-  - Enviar alerta na tela do jogador (`/api/admin/player-action/alert`)
-  - Redefinir senha de usuário (`/api/admin/users/:id/reset-password`)
+  - Desconectar sessão com revogação real (`/api/admin/player-action/disconnect`): incrementa `sessionVersion` no `UserRecord`, invalida JWTs antigos tanto no `server.ts` quanto no `auth-service`, emite `{ type: 'session_revoked', reason }`, fecha WebSockets ativos com código `4001` (impedindo reconexão automática no cliente) e bloqueia entrada/criação de salas para tokens revogados.
+  - Enviar alerta direto na tela do jogador (`/api/admin/player-action/alert`): localiza o destinatário por `authenticatedUserId`, exibe banner global sonoro no cliente e retorna erro caso o jogador esteja offline.
+  - Redefinir senha (`POST /api/admin/users/:id/reset-password`), alterar status (`POST /api/admin/users/:id/status`), limpar salas sem humanos (`POST /api/admin/rooms/cleanup-empty`), consultar auditoria de sessão (`GET /api/admin/audit-log`) e exportar snapshot JSON.
 
-66. Guia de Liberação de Microfone no PC (Firefox & Chrome via HTTP/IP)
+66. Guia de Liberação de Microfone no PC e HTTPS Automático (`configdns.sh`)
 
 Para suportar ambientes de desenvolvimento e VMs acessadas via IP direto em HTTP (sem SSL), a plataforma providencia guias integrados:
 - **Firefox:** Ajustes em `about:config` alterando `media.devices.insecure.enabled` e `media.getusermedia.insecure.enabled` de `false` para `true`.
 - **Google Chrome / Edge:** Acesso a `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, definindo como `Enabled` e adicionando a origem/IP.
+- **Produção HTTPS (`configdns.sh`):** Script oficial para configurar domínio DuckDNS + proxy reverso Caddy com SSL/HTTPS e WebSockets (`wss://`) na porta 3000, liberando microfone WebRTC nativamente.
 
-67. Suíte de Testes Automatizados e Confiabilidade (109 Testes — v2.2.3)
+67. Suíte de Testes Automatizados e Confiabilidade (126 Testes — v2.3.0)
 
-A suíte de testes do Uno KaWiHe v2.2.3 compreende **109 testes automatizados** executados via Vitest em 9 arquivos (`tests/unoEngine.test.ts`: 26, `tests/serverIntegration.test.ts`: 19, `tests/tournamentEngine.test.ts`: 22, `tests/tournamentWo.test.ts`: 19, `tests/tournamentIntegration.test.ts`: 5, `tests/tournamentStress.test.ts`: 2, `tests/importParser.test.ts`: 6, `tests/importService.test.ts`: 7, `tests/importIntegration.test.ts`: 3), cobrindo regras de jogo, modo Duplas 2v2, proteção anti-fraude, isolamento de sockets, validação estrita de rotas administrativas e torneios, motor de torneios em escala, invariante das 108 cartas no W.O. e o módulo completo do Importador de Usuários em Massa. O servidor de desenvolvimento gerencia o middleware do Vite com estabilidade e tratamento de falhas de transporte.
+A suíte de testes do Uno KaWiHe v2.3.0 compreende **126 testes automatizados** executados via Vitest em 12 arquivos (`tests/unoEngine.test.ts`: 26, `tests/serverIntegration.test.ts`: 19, `tests/participationLogic.test.ts`: 9, `tests/tournamentEngine.test.ts`: 22, `tests/tournamentWo.test.ts`: 19, `tests/tournamentIntegration.test.ts`: 5, `tests/tournamentStress.test.ts`: 2, `tests/tournamentAdminLifecycle.test.ts`: 6, `tests/importParser.test.ts`: 6, `tests/importService.test.ts`: 7, `tests/importIntegration.test.ts`: 3, `tests/sessionRevocation.test.ts`: 2), cobrindo regras de jogo, modo Duplas 2v2, proteção anti-fraude, isolamento de sockets, revogação real de sessão JWT/4001, versionamento `/api/version`, encerramento/reagendamento/limpeza de temporários em torneios, invariante das 108 cartas no W.O. e o módulo completo do Importador de Usuários em Massa.
 
 68. Sistema de Torneios (`tournamentEngine.ts` e `data/tournaments.json`)
 
@@ -1515,6 +1516,7 @@ A suíte de testes do Uno KaWiHe v2.2.3 compreende **109 testes automatizados** 
 - Criação, início, simulação pré-início (`/api/tournaments/:id/simulate`) e decisões administrativas restritas a JWT válido com `role === 'admin'` (sem fallback de `x-admin-pin`).
 - Remoção por W.O. (`removeTournamentPlayerWO`) aplica-se exclusivamente a salas com `tournamentId` no modo individual após expiração de `reconnectGraceMs`, devolvendo cartas da mão e `stagedCardPlay` abaixo do topo do descarte sem violar a contagem de 108 cartas. Em salas 2v2, W.O. individual é rejeitado e a desistência concede vitória da partida à equipe adversária.
 - Em reinício do servidor com partidas ativas, os torneios entram em pausa (`server_restart`) aguardando resolução administrativa sem inventar vencedor automático.
+- **Ciclo de Vida e Limpeza Segura (`tournamentCleanupService.ts`):** suporte a reagendamento (`POST /api/tournaments/:id/reschedule`), encerramento seguro (`POST /api/tournaments/:id/close`, preservando histórico e contas), auditoria (`GET /api/tournaments/:id/audit`) e exclusão isolada de contas temporárias com proveniência explícita (`accountOriginType === 'tournament_temporary' && isTemporary && temporaryTournamentId`) mediante desafio matemático único no servidor e rollback atômico.
 
 69. Importador de Usuários em Massa e Ciclo de Vida de Contas (`importService.ts`, `importParser.ts`, `dataLock.ts`)
 
@@ -1522,5 +1524,12 @@ A suíte de testes do Uno KaWiHe v2.2.3 compreende **109 testes automatizados** 
 - Regras padronizadas: senha mínima de **4 caracteres** em todo o sistema; `displayName` obrigatório e único (normalizado em Unicode NFKC, sem fallback automático para `username`); `role` sempre `'player'`; limites de **512 KB** e **200 registros** por lote; torneios `doubles` bloqueados na V1 (evolução futura prevista com coluna `teamName`).
 - Desempenho e integridade: hashing `bcrypt` em `worker_threads` nativa fora do lock (evitando bloqueio de WebSockets), serialização global via mutex FIFO + `data/.kawihe.lock`, proveniência (`createdByImportBatchId`, `createdByImportOperationId`), telemetria por item (`userOpStatus`, `enrollOpStatus`) e máquina de estados WAL em `data/import_batches.json` (`running` | `completed` | `failed` | `partial` | `reconciling`) com checkpoint intermediário (`usersSaved`) e reconciliação automática (`reconcileIncompleteImportBatches`) na inicialização do servidor.
 - Privacidade e ciclo de vida: zero retenção de senhas/hashes/CSV bruto em lotes ou logs; estados `active`, `disabled` e `archived` aplicados em login (HTTP 403), `/api/auth/me`, JWT, salas, torneios e WebSockets ativos (desconexão imediata código `4003`); exclusão física permitida apenas para contas criadas pelo lote sem histórico de partidas, torneios, salas ativas ou convites.
+
+70. Versionamento Explícito, Histórico Resumido e Validação de Deploy (`v2.3.0`)
+
+- `src/utils/versionHistory.ts` centraliza `APP_VERSION` (`2.3.0`), `APP_RELEASE_DATE` e `RELEASE_HISTORY` como fonte única empacotada no frontend e no backend.
+- `GET /api/version` retorna `{ success, version, tag, releaseDate, latestRelease, history }`.
+- `LoginScreen`, `Lobby` e `AdminRoomsModal` exibem o selo clicável da versão abrindo `ChangelogModal.tsx`, que compara ao vivo a versão do cliente com `/api/version` (`no-store`) e alerta qualquer divergência por cache ou falha de atualização.
+- A Etapa 6 do `deploy.sh` (repositório oficial `edinhogrubert/Uno-KaWiHe`) valida que `/api/version` coincide com o `package.json`, falhando o deploy se o container em execução estiver desatualizado.
 
 

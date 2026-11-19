@@ -1,6 +1,6 @@
-# 📊 CASOS DE USO — UNO KAWIHE v2.2.3
+# 📊 CASOS DE USO — UNO KAWIHE v2.3.0
 
-Este documento mapeia os principais fluxos de uso, interações, cenários de segurança e validações de testes do sistema **Uno KaWiHe v2.2.3**, detalhando pré-condições, fluxos principais, cenários alternativos e comportamentos esperados.
+Este documento mapeia os principais fluxos de uso, interações, cenários de segurança e validações de testes do sistema **Uno KaWiHe v2.3.0**, detalhando pré-condições, fluxos principais, cenários alternativos e comportamentos esperados.
 
 ---
 
@@ -124,18 +124,50 @@ Este documento mapeia os principais fluxos de uso, interações, cenários de se
 
 ---
 
-## 🧪 Caso de Uso 10: Execução da Suíte Completa de Testes (`npm test`)
-* **Descrição:** Permite validar regras de negócio, modo 2v2, torneios, W.O., importador em massa, integridade de WebSocket e políticas de segurança.
+## 🔌 Caso de Uso 10: Desconexão Real de Sessão, Mensagens Diretas & Painel Central Admin
+* **Descrição:** O Administrador gerencia usuários e sessões ativas diretamente pelo Painel Central (`AdminRoomsModal`) ou Lobby (`PlayerReportModal`).
+* **Fluxo Principal:**
+  1. Ao clicar em qualquer usuário no Lobby ou nas abas **Salas** / **Usuários** do Painel Central, abre-se o **Relatório Diagnóstico** (`PlayerReportModal`).
+  2. O Painel Central também oferece filtros rápidos (`online`, `temporários`, `inativos`, `admins`), suspensão/reativação inline, limpeza de salas sem humanos (`/api/admin/rooms/cleanup-empty`), log de auditoria e métricas da VM na aba **Sistema & Auditoria**.
+  3. Ao enviar um alerta direto (`POST /api/admin/player-action/alert`), o servidor localiza o socket pelo `authenticatedUserId` e entrega um banner global sonoro no topo da tela do jogador (retornando erro caso o destinatário esteja offline).
+  4. Ao clicar em **Desconectar Sessão** (`POST /api/admin/player-action/disconnect`), o servidor incrementa `sessionVersion` do usuário (invalidando todos os JWTs antigos no servidor principal e no `auth-service`), envia `session_revoked`, fecha o WebSocket com código `4001` e força retorno imediato à tela de login sem auto-reconexão.
+
+---
+
+## 🏷️ Caso de Uso 11: Versionamento Visível, Detecção de Divergência & Deploy Verificado
+* **Descrição:** Permite a qualquer jogador ou administrador confirmar em segundos qual versão está rodando no navegador e no servidor após um deploy.
+* **Fluxo Principal:**
+  1. A Tela de Login, o Lobby e o Painel Admin exibem o selo clicável `v2.3.0`.
+  2. Ao clicar, o `ChangelogModal` exibe o resumo das atualizações (`src/utils/versionHistory.ts`) e consulta `GET /api/version` (`no-store`) para comparar Cliente × Servidor.
+  3. Em caso de divergência (cache antigo do navegador ou deploy parcial), exibe alerta visual orientando recarregar (`F5`) ou verificar o servidor.
+  4. Durante o deploy na VM (`./deploy.sh`), a Etapa 6 valida automaticamente que `/api/version` coincide com o `package.json`, falhando o deploy se o servidor ainda responder versão antiga.
+
+---
+
+## 🧹 Caso de Uso 12: Encerramento, Reagendamento e Limpeza de Temporários em Torneios
+* **Descrição:** Permite encerrar ou reagendar torneios preservando histórico/usuários e excluir apenas contas temporárias elegíveis com proteção contra erros.
+* **Fluxo Principal:**
+  1. `POST /api/tournaments/:id/reschedule`: transfere a data do torneio (`rescheduled`) mantendo inscrições abertas.
+  2. `POST /api/tournaments/:id/close`: encerra o torneio (`closed`) desde que não haja partidas ativas, preservando resultados e todas as contas.
+  3. `POST /api/tournaments/:id/temporary-users/challenge` e `/delete`: gera desafio matemático de uso único no servidor e exclui estritamente contas criadas como temporárias daquele torneio sem dependências externas (com rollback atômico em erro).
+
+---
+
+## 🧪 Caso de Uso 13: Execução da Suíte Completa de Testes (`npm test`)
+* **Descrição:** Permite validar regras de negócio, modo 2v2, torneios, W.O., lifecycle, importador em massa, revogação de sessão, versionamento e políticas de segurança.
 * **Fluxo Principal:**
   1. O desenvolvedor executa `npm test` (ou `npx vitest run --reporter=verbose`) no terminal.
-  2. O runner executa **109 testes automatizados** em 9 suítes com 100% de aprovação:
+  2. O runner executa **126 testes automatizados** em 12 suítes com 100% de aprovação:
      - **26 testes unitários** no `tests/unoEngine.test.ts`
      - **19 testes de integração e segurança** no `tests/serverIntegration.test.ts`
+     - **9 testes de regras de participação e presença** no `tests/participationLogic.test.ts`
      - **22 testes de domínio puro de torneios** no `tests/tournamentEngine.test.ts`
      - **19 testes de remoção segura por W.O.** no `tests/tournamentWo.test.ts`
      - **5 testes de integração real de torneios HTTP/WS** no `tests/tournamentIntegration.test.ts`
      - **2 testes de progressão em escala ponta a ponta de torneios** no `tests/tournamentStress.test.ts`
+     - **6 testes de encerramento, reagendamento e limpeza de temporários** no `tests/tournamentAdminLifecycle.test.ts`
      - **6 testes do parser RFC-4180 do importador** no `tests/importParser.test.ts`
      - **7 testes de serviço, WAL multi-item, proveniência, ciclo de vida e benchmark Worker** no `tests/importService.test.ts`
      - **3 testes de integração HTTP/WS e desconexão ao vivo** no `tests/importIntegration.test.ts`
+     - **2 testes de revogação de sessão (`sessionVersion`/`4001`) e `/api/version`** no `tests/sessionRevocation.test.ts`
 

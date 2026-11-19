@@ -1,5 +1,14 @@
 # 01 — Casos de uso
 
+| Metadado | Valor |
+|---|---|
+| **Finalidade** | Catálogo executivo dos casos de uso por papel global e papel na sala. |
+| **Público-alvo** | Agentes de IA, Desenvolvedores, QA e Auditores. |
+| **Status** | **NORMATIVO (Nível 2)** |
+| **Fonte de Autoridade** | Subordinado ao Nível 0 (`edinho.grubert@gmail.com`) e Nível 1 (`AGENTS.md`). |
+| **Versão / Commit / Data** | `v2.3.0` · Commit ref. `6d25e83` · Revisado em `2026-11-18` |
+| **Referências Relacionadas** | `USE_CASES.md`, `02_regras.md`, `13_MATRIZ_RASTREABILIDADE.md`. |
+
 Papéis globais: **Visitante**, **Registrado**, **Admin**. Papéis na sala: **Host**, **Jogador**, **Bot**, **Espectador**.
 
 ## Menu / Lobby
@@ -8,7 +17,7 @@ Papéis globais: **Visitante**, **Registrado**, **Admin**. Papéis na sala: **Ho
 - **UC-MEN-03 Explorar salas abertas** — lista salas públicas (código, host, ocupação, tempo de turno).
 - **UC-MEN-04 Treino solo** — sala com bots.
 - **UC-MEN-05 Cadastro** — exige convite válido (código com `@`); limite de tentativas por IP.
-- **UC-MEN-06 Login** — gera JWT assinado.
+- **UC-MEN-06 Login** — gera JWT assinado com `sessionVersion`.
 
 ## Sala
 - **UC-SAL-01 Configurar sala** (host).
@@ -44,18 +53,24 @@ Papéis globais: **Visitante**, **Registrado**, **Admin**. Papéis na sala: **Ho
 - **UC-TOR-03 Iniciar jogos e avançar rodadas** — cria salas vinculadas (`tournamentId`), registra resultado e avança grupos/chaves com suporte a byes e *early clinch*.
 - **UC-TOR-04 Desempate** — partida extra (`extra_match`) ou decisão administrativa (`admin_decision`), nunca por `roundPointsWon` na V1.
 - **UC-TOR-05 W.O. e recuperação pós-reinício** — remoção segura de desconectado em torneio individual após `reconnectGraceMs`, devolvendo cartas ao descarte sem violar as 108 cartas; pausa automática se o servidor reiniciar durante partidas ativas.
+- **UC-TOR-06 Encerramento, reagendamento e limpeza de temporários** — reagendamento (`rescheduled`) mantém inscrições; encerramento (`closed`) preserva histórico/usuários; exclusão de contas temporárias exige desafio matemático único no servidor (`tournamentCleanupService.ts`).
 
 ## Admin (JWT com `role === 'admin'`)
-- **UC-ADM-01 Gerenciar usuários** — listar, criar diretamente, redefinir senha e excluir (exceto `edinho`).
+- **UC-ADM-01 Gerenciar usuários** — listar com filtros rápidos (`online`, `temporários`, `inativos`, `admins`), criar, redefinir senha, suspender/reativar inline e excluir (exceto `edinho`).
 - **UC-ADM-02 Gerenciar convites** — gerar e revogar.
-- **UC-ADM-03 Monitorar salas e enviar alertas** — listar, enviar mensagem/broadcast, expulsar ou fechar sala.
-- **UC-ADM-04 Relatório de jogador** — `/api/admin/player-report/:target`.
-- **UC-ADM-05 Moderar** — expulsar da sala, derrubar sessão WebSocket, enviar alerta direto.
-- **UC-ADM-06 Monitor de VM** — `/api/admin/vm-metrics` com telemetria de CPU, RAM, disco e saúde.
+- **UC-ADM-03 Painel Central de Administração** — monitorar salas, limpar salas sem humanos (`/api/admin/rooms/cleanup-empty`), enviar alertas/mensagens diretas por usuário ou sala, auditar ações (`/api/admin/audit-log`) e exportar snapshot JSON.
+- **UC-ADM-04 Relatório de jogador** — `/api/admin/player-report/:target` acessível ao clicar sobre qualquer usuário no Lobby ou no Painel Central Admin (`Salas` ou `Usuários`).
+- **UC-ADM-05 Moderar e desconectar sessão** — expulsar da sala, enviar alerta direto (resolução por `authenticatedUserId`) e derrubar sessão com revogação imediata de JWT (`sessionVersion`), evento `session_revoked` e close WS `4001`.
+- **UC-ADM-06 Monitor de VM & Versionamento** — `/api/admin/vm-metrics` e aba *Sistema & Auditoria* com checagem de sincronização de versão cliente × servidor (`/api/version`).
+
+## Versionamento & Deploy
+- **UC-VER-01 Consultar versão e novidades** — selo clicável na Tela de Login, Lobby e Painel Admin abre `ChangelogModal` com histórico resumido (`src/utils/versionHistory.ts`) e verificação ao vivo via `GET /api/version`.
+- **UC-VER-02 Validação no deploy** — Etapa 6 do `deploy.sh` valida que `/api/version` corresponde ao `package.json` (`v2.3.0`) e `configdns.sh` configura DuckDNS + HTTPS via Caddy.
 
 ## Importador de Usuários em Massa (`AdminImportPanel` + `AdminImportHistoryPanel`)
 - **UC-IMP-01 Validar e importar lote (Modo A `create_only`)** — upload de CSV ou colagem de texto (até 512 KB / 200 registros) com pré-validação linha a linha, exigência de `displayName` único (NFKC) e senha mínima de 4 caracteres, sem vínculo obrigatório com torneio.
-- **UC-IMP-02 Importar e inscrever em torneio individual (Modos B e C)** — `create_and_enroll` (cria novas contas e inscreve) ou `enroll_existing` (inscreve contas existentes em torneio `individual` em `registration`), bloqueando torneios `doubles` nesta v1.
+- **UC-IMP-02 Importar e inscrever em torneio (Modos B e C)** — `create_and_enroll` (cria novas contas e inscreve) ou `enroll_existing` (inscreve contas existentes em torneio aberto em `registration` ou `rescheduled`). Para torneios `individual`, inscreve cada linha válida; para torneios `doubles` (`2v2`), agrupa pares consecutivos de linhas válidas (1ª e 2ª = Dupla 1, 3ª e 4ª = Dupla 2), rejeitando contagem ímpar com `ODD_ROW_COUNT_DOUBLES` (`CONFIRMADO` em `server/importService.ts` e `tests/importService.test.ts` — ver `DIV-02` em `/13_MATRIZ_RASTREABILIDADE.md`).
 - **UC-IMP-03 Consultar histórico e auditoria de lotes** — listagem filtrável por busca/modo/status e visão detalhada separando `created_by_batch` vs `existing_enrolled_only`, sem expor senhas ou hashes.
 - **UC-IMP-04 Gerenciar ciclo de vida pós-importação** — análise prévia de impacto (`/users/impact`), desativação (`disabled`), arquivamento (`archived`), reativação (`active`) com desconexão imediata de WebSockets ativos, e exclusão segura permitida apenas quando não há dependências históricas.
+
 

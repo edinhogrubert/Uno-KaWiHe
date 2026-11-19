@@ -1,6 +1,6 @@
-# 🃏 MANUAL DE JOGO — UNO KAWIHE v2.2
+# 🃏 MANUAL DE JOGO — UNO KAWIHE v2.3.0
 
-Bem-vindo ao **Uno KaWiHe v2.2**, o jogo de cartas mais divertido do mundo feito sob medida para brincar com a família, amigos e crianças em um ambiente seguro, privado, sem anúncios e totalmente autoritativo! Este manual explica passo a passo o funcionamento do jogo, o significado de cada carta, as regras oficiais aplicadas, a disposição visual da mesa e as proteções especiais do nosso sistema.
+Bem-vindo ao **Uno KaWiHe v2.3.0**, o jogo de cartas mais divertido do mundo feito sob medida para brincar com a família, amigos e crianças em um ambiente seguro, privado, sem anúncios e totalmente autoritativo! Este manual explica passo a passo o funcionamento do jogo, o significado de cada carta, as regras oficiais aplicadas, a disposição visual da mesa e as proteções especiais do nosso sistema.
 
 ---
 
@@ -71,13 +71,13 @@ Ao final de cada partida, os pontos são computados e salvos permanentemente no 
 * **Cartas Especiais (🚫, 🔄, ➕2):** Valem **20 pontos** cada.
 * **Coringas (🎨, ➕4):** Valem **50 pontos** cada.
 
-Suas vitórias totais e pontuação histórica são exibidas como troféus dourados no menu **"Troféus & Estatísticas"** da sua barra lateral! O motor de regras do Uno KaWiHe v2.2 é 100% testado por uma suíte de testes unitários automatizados (`Vitest`).
+Suas vitórias totais e pontuação histórica são exibidas como troféus dourados no menu **"Troféus & Estatísticas"** da sua barra lateral! O motor de regras do Uno KaWiHe v2.3.0 é validado por **126 testes automatizados** (`Vitest`).
 
 ---
 
-## 🎙️ 8. Como Liberar o Microfone no PC (Firefox & Chrome via HTTP/IP)
+## 🎙️ 8. Como Liberar o Microfone no PC (HTTPS ou HTTP/IP)
 
-Navegadores modernos exigem conexão segura (HTTPS) para liberar o microfone. Ao acessar o Uno KaWiHe diretamente pelo IP da sua VM em HTTP, o navegador bloqueia o microfone por padrão. Veja como liberar em poucos cliques:
+Navegadores modernos exigem conexão segura (HTTPS) para liberar o microfone automaticamente. Se você configurar um domínio com SSL gratuito usando o script `sudo ./configdns.sh` (DuckDNS + Caddy), o microfone funcionará sem ajustes manuais. Caso acesse diretamente pelo IP da VM em HTTP, veja como liberar no navegador:
 
 ### 🦊 Como liberar no Firefox para PC
 1. Abra o **Firefox** no computador.
@@ -118,5 +118,12 @@ O Administrador pode organizar **Torneios** diretamente pelo menu **Torneios**:
 - **Senha Mínima:** Todas as contas do Uno KaWiHe exigem senha com no mínimo **4 caracteres**.
 - **Nome de Exibição Único:** Cada jogador possui um Nome de Exibição (`displayName`) único no sistema para evitar confusão nas mesas.
 - **Contas Desativadas ou Arquivadas:** Administradores podem importar grupos de jogadores em lote e desativar/arquivar contas temporariamente sem apagar seus troféus ou históricos de torneios. Contas desativadas ou arquivadas têm login e conexão WebSocket bloqueados até serem reativadas.
+- **Encerramento de Sessão pelo Admin:** Quando um administrador encerra uma sessão ativa, o usuário é imediatamente desconectado e redirecionado para a tela de login, exigindo nova autenticação.
+
+---
+
+## 🏷️ 12. Versão do Jogo, Novidades e Diagnóstico de Atualização
+- **Selo Clicável de Versão:** Na **Tela de Login**, no **Lobby** e no **Painel Central de Administração**, você encontra o selo **`v2.3.0`**.
+- **Histórico Resumido & Sincronização:** Ao clicar no selo, abre-se o resumo das últimas atualizações e uma verificação ao vivo com o servidor (`/api/version`). Se o navegador estiver em cache antigo após uma atualização, o próprio painel alerta para pressionar **`F5`** (`Ctrl+Shift+R`).
 
 

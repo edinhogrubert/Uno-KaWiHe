@@ -1,19 +1,28 @@
 # 05 — Decisões (ADR curto)
 
+| Metadado | Valor |
+|---|---|
+| **Finalidade** | Registro consolidado de Decisões Arquiteturais (Architecture Decision Records). |
+| **Público-alvo** | Arquitetos, Engenheiros de Software, Agentes de IA e Auditores. |
+| **Status** | **NORMATIVO (Nível 2)** |
+| **Fonte de Autoridade** | Subordinado ao Nível 0 (`edinho.grubert@gmail.com`) e Nível 1 (`AGENTS.md`). |
+| **Versão / Commit / Data** | `v2.3.0` · Commit ref. `6d25e83` · Revisado em `2026-11-18` |
+| **Referências Relacionadas** | `03_arquitetura.md`, `11_FREE_TIER_COMPLIANCE.md`, `12_OPERACAO_E_RECUPERACAO.md`. |
+
 ## ADR-001 · v2.1 · Servidor autoritativo
 Motivo: impedir trapaça e vazamento de cartas. Consequência: cliente só envia intenções; mãos vão por `hand_state`.
 
 ## ADR-002 · v2.2 · `reconnectToken` separado do `playerId`
 Motivo: `playerId` é público; usá-lo como segredo permitiria usurpação. Consequência: token gerado por sala, enviado só no `room_joined`.
 
-## ADR-003 · v2.2 · Persistência em JSON local com escrita atômica (AI Studio Free Tier)
-Motivo: simplicidade operacional, zero custo, sem necessidade de banco de dados pago externo. Consequência: temp → fsync → rename.
+## ADR-003 · v2.2 · Persistência em JSON local com escrita atômica (`fsync` + `rename`)
+Motivo: simplicidade operacional, zero custo, sem necessidade de banco de dados pago externo. Consequência: `atomicWriteFileSync` (`temp` → `fsyncSync` → `renameSync`).
 
 ## ADR-004 · v2.2 · Voz em malha P2P sem servidor de mídia pago
-Motivo: custo zero e simplicidade. Consequência: WebRTC direto entre navegadores.
+Motivo: custo zero e simplicidade. Consequência: WebRTC direto entre navegadores com STUN público gratuito (`stun.l.google.com`).
 
-## ADR-005 · v2.2 · Regra Inquebrável AI Studio Free Tier
-Motivo: garantir que nenhuma dependência ou serviço pago seja introduzido sem validação prévia. Consequência: proibição estrita de serviços cobrados.
+## ADR-005 · v2.2 / v2.3.0 · Política Universal e Inquebrável de Custo Zero (`11_FREE_TIER_COMPLIANCE.md`)
+Motivo: garantir que nenhuma dependência, infraestrutura, domínio, proxy ou serviço pago seja introduzido em qualquer ambiente (AI Studio, Oracle Cloud Always Free, GitHub, Caddy, DuckDNS, Let's Encrypt, Cloudflare). Consequência: proibição estrita de serviços `PAID` ou `TRIAL_ONLY` e aplicação obrigatória do **Free Tier Compliance Gate (7 perguntas)**.
 
 ## ADR-006 · v2.2.3 · Domínio Puro de Torneios (`tournamentEngine.ts`)
 Motivo: isolar chaves, byes, classificação V1 (sem desempate por `roundPointsWon`) e recuperação pós-reinício de transporte HTTP/WS. Consequência: lógica 100% determinística e testável sem mocks de rede.
@@ -29,4 +38,13 @@ Motivo: escrita atômica individual não impede inconsistência entre `users.jso
 
 ## ADR-010 · v2.2.3 · Ciclo de Vida `disabled`/`archived` Preservando Histórico
 Motivo: excluir contas com histórico quebraria estatísticas, tabelas de torneios e auditoria. Consequência: contas com dependências são desativadas/arquivadas (bloqueando login, JWT e WS ativo com close `4003`), reservando exclusão física apenas para contas sem vínculos criadas pelo lote.
+
+## ADR-011 · v2.2.3 · Encerramento Seguro de Torneios & Limpeza Explícita de Temporários (`tournamentCleanupService.ts`)
+Motivo: encerrar torneio não deve apagar contas permanentes nem heurísticas por nome/data podem apagar usuários errados. Consequência: reagendamento (`rescheduled`) e encerramento (`closed`) preservam histórico/contas, e exclusão de temporários exige proveniência explícita (`accountOriginType === 'tournament_temporary' && isTemporary && temporaryTournamentId`), trilha em `data/tournament_audit.json` e desafio matemático de uso único no servidor.
+
+## ADR-012 · v2.3.0 · Revogação Real de Sessão via `sessionVersion` (`4001` / `session_revoked`)
+Motivo: derrubar apenas o socket sem invalidar o JWT fazia o cliente reconectar em 1s e continuar entrando em salas. Consequência: desconexão administrativa incrementa `sessionVersion` no `UserRecord` (verificado em `server.ts` e `auth-service`), envia `session_revoked`, fecha WS com `4001` e força logout imediato sem auto-reconexão.
+
+## ADR-013 · v2.3.0 · Fonte Única de Versionamento (`versionHistory.ts`), `/api/version` e Validação no Deploy
+Motivo: sem versão visível no aplicativo e conferida no container, cache de navegador ou falha silenciosa no deploy deixava dúvidas se a VM atualizou. Consequência: `src/utils/versionHistory.ts` abastece UI e `/api/version`, `ChangelogModal` alerta divergência Cliente × Servidor e a Etapa 6 do `deploy.sh` exige `LIVE_VERSION == package.json`.
 

@@ -1,6 +1,6 @@
-# 📖 MANUAL DE SCRIPTS SHELL (MANUALSH.md) — UNO KAWIHE v2.2
+# 📖 MANUAL DE SCRIPTS SHELL (MANUALSH.md) — UNO KAWIHE v2.3.0
 
-Este manual documenta todos os scripts utilitários em Shell Script (`.sh`) criados no ecossistema do **Uno KaWiHe v2.2**. Eles foram desenvolvidos para automatizar operações de deploy, gerenciamento de usuários, backups seguros, restaurações, monitoramento de saúde da Máquina Virtual (VM) e túneis HTTPS com Cloudflare.
+Este manual documenta todos os scripts utilitários em Shell Script (`.sh`) e automações Node.js criados no ecossistema do **Uno KaWiHe v2.3.0**. Eles automatizam deploy com verificação de versão, DNS + HTTPS (DuckDNS + Caddy), gerenciamento de usuários, backups seguros, restaurações, monitoramento de saúde da VM e túneis Cloudflare.
 
 ---
 
@@ -8,7 +8,9 @@ Este manual documenta todos os scripts utilitários em Shell Script (`.sh`) cria
 
 | Script | Localização | Descrição Principal |
 | :--- | :--- | :--- |
-| **`deploy.sh`** | Raiz / `scripts/deploy.sh` | Orquestrador completo de deploy em produção (Auto-backup + Git Pull + Docker Compose + Health Check). |
+| **`deploy.sh`** | Raiz (`./deploy.sh`) | Orquestrador completo em 6 etapas (`edinhogrubert/Uno-KaWiHe`): Sistema/Swap + Docker + Firewall + Git Pull + Compose + Health Check & validação de `/api/version`. |
+| **`scripts/deploy.sh`** | `scripts/deploy.sh` | Atualização rápida em 3 passos: auto-backup (`scripts/backup.sh`) + `git pull` + build sequencial dos containers. |
+| **`configdns.sh`** | Raiz / `scripts/configdns.sh` | Configura DuckDNS + Proxy Reverso Caddy com SSL/HTTPS automático e suporte a WebSockets (WSS) na porta 3000. |
 | **`create-user.sh`** | Raiz / `scripts/create-user.sh` | Criação segura de usuários administradores ou jogadores com hash `bcryptjs` (fator 12). |
 | **`create-invite.sh`** | `scripts/create-invite.sh` | Geração de códigos de convite restritos (`@XXXX`) para registro de novos usuários. |
 | **`backup.sh`** | Raiz / `scripts/backup.sh` | Ponto de restauração e salvamento de dados com permissões restritas (`chmod 700`/`600`). |
@@ -26,17 +28,23 @@ Este manual documenta todos os scripts utilitários em Shell Script (`.sh`) cria
 
 ## 🛠️ Detalhes e Exemplos de Uso por Script
 
-### 1. `deploy.sh` (Orquestrador de Deploy)
-* **Objetivo:** Automatizar a atualização da aplicação na Máquina Virtual de produção de forma totalmente segura.
-* **O que faz:**
-  1. Cria um ponto de backup automático imediato (`backup.sh`).
-  2. Puxa as últimas alterações do repositório Git (`git pull`).
-  3. Reconstrói e reinicia os containers Docker (`docker compose up -d --build`).
-  4. Executa verificação de saúde (*Health Check*).
+### 1. `deploy.sh` (Orquestrador de Deploy em 6 Etapas) e `scripts/deploy.sh`
+* **Objetivo:** Automatizar a instalação e atualização da aplicação em `/opt/unokawihe` a partir de `https://github.com/edinhogrubert/Uno-KaWiHe.git` com checkpoint de retomada (`/var/tmp/unokawihe_deploy_state`).
+* **O que faz (`./deploy.sh`):**
+  1. **Etapa 1:** Prepara sistema e swap (ideal para 1 GB RAM na OCI Micro).
+  2. **Etapa 2:** Instala/valida Docker e Docker Compose v2.
+  3. **Etapa 3:** Configura firewall local (portas 80, 443 e 3000).
+  4. **Etapa 4:** Clona ou atualiza o repositório e prepara `.env` / permissões.
+  5. **Etapa 5:** Reconstrói e sobe os containers (`docker compose up -d --build`).
+  6. **Etapa 6 (Health Check & Versão):** Consulta `http://localhost:3000/health` e `http://localhost:3000/api/version`, garantindo que a versão viva no container corresponde exatamente ao `package.json` (`v2.3.0`) e abortando o deploy em caso de divergência.
+* **Alternativa (`./scripts/deploy.sh`):** Executa backup via `scripts/backup.sh`, faz `git pull`, reconstrói `kawihe-auth` e `uno-game` sequencialmente e exibe `docker compose ps`.
 * **Modos de Uso:**
   ```bash
-  # Deploy completo (com backup prévio automático)
+  # Deploy completo (com checkpoint por etapa)
   ./deploy.sh
+
+  # Atualização rápida com backup prévio automático
+  ./scripts/deploy.sh
 
   # Visualizar logs em tempo real
   ./deploy.sh logs
@@ -179,7 +187,17 @@ Este manual documenta todos os scripts utilitários em Shell Script (`.sh`) cria
   node scripts/tournament-test.mjs --url http://127.0.0.1:3000 --user edinho --password <SENHA_ADMIN> --modality doubles --teams 4 --best-of 3
 
   # Execução direta via curl sem salvar arquivo local
-  curl -sSL https://raw.githubusercontent.com/wgruberts-jpg/Uno-KaWiHe/main/scripts/tournament-test.mjs | node --input-type=module - --url http://127.0.0.1:3000 --user edinho --password <SENHA_ADMIN>
+  curl -sSL https://raw.githubusercontent.com/edinhogrubert/Uno-KaWiHe/main/scripts/tournament-test.mjs | node --input-type=module - --url http://127.0.0.1:3000 --user edinho --password <SENHA_ADMIN>
+  ```
+
+---
+
+### 14. `configdns.sh` (Domínio DuckDNS + Proxy Reverso Caddy HTTPS)
+* **Objetivo:** Configurar domínio gratuito DuckDNS (com cron de atualização de IP) e proxy reverso Caddy com certificado Let's Encrypt automático para a porta `3000`, habilitando HTTPS e WebSockets (`wss://`) para liberar o microfone WebRTC em todos os navegadores.
+* **Pré-requisitos:** Portas TCP **80** e **443** liberadas na Security List / VCN da nuvem (Oracle Cloud).
+* **Modo de Uso:**
+  ```bash
+  sudo ./configdns.sh
   ```
 
 ---
