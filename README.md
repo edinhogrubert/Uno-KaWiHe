@@ -7,7 +7,7 @@
 | **Finalidade** | Visão geral do projeto, destaques da versão, guia rápido de execução e índice da documentação. |
 | **Público-alvo** | Proprietário, Desenvolvedores, Operadores de VM e Agentes de IA. |
 | **Status** | **INFORMATIVO (Nível 2)** |
-| **Fonte de Autoridade** | Subordinado ao Nível 0 (`edinho.grubert@gmail.com`) e Nível 1 (`AGENTS.md`). |
+| **Fonte de Autoridade** | Subordinado ao Nível 0 (**quem digita diretamente aqui no chat**; ref. `edinho.grubert@gmail.com`) e Nível 1 (`AGENTS.md`). |
 | **Repositório Oficial** | `https://github.com/edinhogrubert/Uno-KaWiHe` (`main`) |
 | **Versão / Commit / Data** | `v2.3.0` · Commit ref. `6d25e83` · Revisado em `2026-11-18` |
 
@@ -39,14 +39,16 @@
 
 ---
 
-## 📚 Documentação do Projeto (22 Documentos na Raiz)
+## 📚 Documentação do Projeto (24 Documentos na Raiz)
 
-- 🤖 [**AGENTS.md**](./AGENTS.md) — Constituição operacional de Nível 1 (autoridade subordinada ao Nível 0 `edinho.grubert@gmail.com`, Hierarquia Níveis 0–4, Regra de Conflitos e mapa mestre).
-- 📜 [**00_visao.md**](./00_visao.md) a [**09_prompts.md**](./09_prompts.md) — Especificação modular de visão (`00`), casos de uso (`01`), regras (`02`), arquitetura (`03`), status (`04`), ADRs (`05`), testes (`06`), histórico (`07`), handoff (`08`) e prompts (`09`).
+- 🤖 [**AGENTS.md**](./AGENTS.md) — Constituição operacional de Nível 1 (autoridade subordinada ao Nível 0: **quem digita diretamente aqui no chat**; Hierarquia Níveis 0–4, 5 Princípios `P1`–`P5`, Regra de Conflitos e mapa mestre).
+- 📜 [**00_visao.md**](./00_visao.md) a [**09_prompts.md**](./09_prompts.md) — Especificação modular de visão (`00`), casos de uso (`01`), regras (`02`), arquitetura (`03`), status (`04`), ADRs com parecer divergente (`05`), testes (`06`), histórico (`07`), handoff em 8 seções (`08`) e prompts (`09`).
 - 🏗️ [**10_RECONSTRUCAO_COMPLETA.md**](./10_RECONSTRUCAO_COMPLETA.md) — Manual normativo de reconstrução do zero e recuperação de desastres em **28 etapas** reproduzíveis + 10 critérios objetivos de conclusão.
 - 💸 [**11_FREE_TIER_COMPLIANCE.md**](./11_FREE_TIER_COMPLIANCE.md) — Política Universal de Custo Zero, classificação de serviços, matriz de conformidade, regras Oracle Cloud Always Free e **Free Tier Compliance Gate**.
 - ⚙️ [**12_OPERACAO_E_RECUPERACAO.md**](./12_OPERACAO_E_RECUPERACAO.md) — Manual de operação diária, persistência atômica (`fsync`+`rename`), lock multi-processo (`data/.kawihe.lock`), WAL e runbooks de Disaster Recovery.
-- 🔗 [**13_MATRIZ_RASTREABILIDADE.md**](./13_MATRIZ_RASTREABILIDADE.md) — Matriz de rastreabilidade ponta a ponta (requisitos × código × rotas × 126 testes), inventário completo e registro auditado de divergências (`DIV-01` a `DIV-06`).
+- 🔗 [**13_MATRIZ_RASTREABILIDADE.md**](./13_MATRIZ_RASTREABILIDADE.md) — Matriz de rastreabilidade ponta a ponta (IDs estáveis `RF-*`/`RN-*`/`API-*`/`WS-*`/`UI-*`/`DATA-*`/`ENV-*`/`OPS-*` × código × 126 testes), cálculo formal de cobertura (`100,0%`) e registro auditado de divergências (`DIV-01` a `DIV-06`).
+- 🧠 [**14_CONFIABILIDADE_IA.md**](./14_CONFIABILIDADE_IA.md) — Protocolo normativo único de Confiabilidade de Agentes de IA: 5 princípios (`P1`–`P5`), 7 estados oficiais (`VERIFICADO`..`CONTRADITÓRIO`), anti-alucinação, contestação técnica independente, auditoria adversarial (9 perguntas), gestão de contexto, ritual de 10 passos e cenários de aceitação **A–J**.
+- 🔮 [**15_FUTURAS_FUNCIONALIDADES.md**](./15_FUTURAS_FUNCIONALIDADES.md) — Catálogo normativo e especificação técnica de futuras funcionalidades e regras da casa (`PROPOSTO` · 100% Free Tier).
 - 🃏 [**GAME_MANUAL.md**](./GAME_MANUAL.md) — Manual oficial de regras do jogo, cartas especiais, penalidades de UNO, 2v2, torneios e guia de microfone no PC.
 - 📄 [**SYSTEM_SPECIFICATION.md**](./SYSTEM_SPECIFICATION.md) — Especificação técnica completa de arquitetura, envelopes de WebSocket v2, reconexão segura e persistência.
 - 🛠️ [**manualSH.md**](./manualSH.md) — Manual completo dos scripts shell (`.sh` e `.mjs`) de deploy, DNS/HTTPS, backup e administração.

@@ -5,11 +5,11 @@
 | **Finalidade** | Fotografia verificável do estado implementado (`v2.3.0`), métricas empíricas e backlog Free Tier. |
 | **Público-alvo** | Proprietário, Agentes de IA, Desenvolvedores e Auditores. |
 | **Status** | **INFORMATIVO / OPERACIONAL (Nível 2)** |
-| **Fonte de Autoridade** | Subordinado ao Nível 0 (`edinho.grubert@gmail.com`) e Nível 1 (`AGENTS.md`). |
+| **Fonte de Autoridade** | Subordinado ao Nível 0 (**quem digita diretamente aqui no chat**; ref. `edinho.grubert@gmail.com`) e Nível 1 (`AGENTS.md`). |
 | **Versão / Commit / Data** | `v2.3.0` · Commit ref. `6d25e83` · Atualizado em `2026-11-18` |
-| **Referências Relacionadas** | `AGENTS.md`, `02_regras.md`, `11_FREE_TIER_COMPLIANCE.md`, `13_MATRIZ_RASTREABILIDADE.md`. |
+| **Referências Relacionadas** | `AGENTS.md`, `02_regras.md`, `11_FREE_TIER_COMPLIANCE.md`, `13_MATRIZ_RASTREABILIDADE.md`, `14_CONFIABILIDADE_IA.md`, `15_FUTURAS_FUNCIONALIDADES.md`. |
 
-## Implementado (`CONFIRMADO`)
+## Implementado (`VERIFICADO`)
 - Servidor autoritativo com validação das jogadas (`unoEngine.ts` + `server.ts`).
 - `reconnectToken` secreto (`crypto.randomUUID()`) obrigatório na reconexão.
 - Envelope `protocolVersion: 2` com idempotência por `messageId` (cache 60s).
@@ -31,16 +31,15 @@
 - **Mensagens Diretas Admin:** entrega garantida por `authenticatedUserId` com banner global z-[90] de 15s e feedback de erro caso o usuário esteja offline.
 - Ferramenta de simulação e teste automatizado de torneios de ponta a ponta (`scripts/tournament-test.mjs` / `npm run tournament-test`) via JWT real + WebSockets, preservação de `scripts/capacity-test.mjs`, suporte a Individual e Duplas 2v2, desempates e telemetria da VM.
 - Guia de microfone para PC em HTTP/IP (Firefox/Chrome), guia de VM e script `configdns.sh` (DuckDNS + HTTPS via Caddy).
-- **Governança, Reconstrução e Conformidade Free Tier (`10` a `13`):** manuais normativos `/10_RECONSTRUCAO_COMPLETA.md` (28 etapas), `/11_FREE_TIER_COMPLIANCE.md` (Política Universal de Custo Zero e Gate de 7 perguntas), `/12_OPERACAO_E_RECUPERACAO.md` (DR e persistência) e `/13_MATRIZ_RASTREABILIDADE.md` (rastreabilidade ponta a ponta + registro de divergências `DIV-01`..`DIV-06`).
+- **Governança, Reconstrução, Conformidade Free Tier, Confiabilidade de IA e Roadmap (`10` a `15`):** manuais normativos `/10_RECONSTRUCAO_COMPLETA.md` (28 etapas), `/11_FREE_TIER_COMPLIANCE.md` (Política Universal de Custo Zero e Gate de 7 perguntas), `/12_OPERACAO_E_RECUPERACAO.md` (DR e persistência), `/13_MATRIZ_RASTREABILIDADE.md` (rastreabilidade ponta a ponta por IDs estáveis, cálculo formal de cobertura `100,0%` e divergências `DIV-01`..`DIV-06`), `/14_CONFIABILIDADE_IA.md` (protocolo de confiabilidade cognitiva, 7 estados oficiais, anti-alucinação, contestação independente e cenários A–J) e `/15_FUTURAS_FUNCIONALIDADES.md` (catálogo normativo de futuras funcionalidades `FUT-*`).
 - Suíte de testes: **126 testes** passando em 12 arquivos (`unoEngine`: 26, `serverIntegration`: 19, `participationLogic`: 9, `tournamentEngine`: 22, `tournamentWo`: 19, `tournamentIntegration`: 5, `tournamentStress`: 2, `tournamentAdminLifecycle`: 6, `importParser`: 6, `importService`: 7, `importIntegration`: 3, `sessionRevocation`: 2).
 
-## Planejamento / Backlog (`PROPOSTO` — Pós-v2.3.0 · 100% Free Tier)
-- Evolução futura do Importador: suporte a coluna explícita `teamName` no CSV para nomear equipes em torneios `doubles` (`username;displayName;password;teamName`), exportação de metadados de lote sem credenciais e senha temporária com troca obrigatória no primeiro login.
-- Conversão automática para bot ou passagem de turno após 45s quando jogador desconectar em sala com `turnTimeLimit = 0`.
-- Rate limiting específico por segundo para chat e sinalização ICE/WebRTC no WebSocket.
-- Suporte opcional a servidor TURN self-hosted (Coturn gratuito) caso redes 4G com NAT simétrico exijam relay de voz.
-- Hardening automático de permissões (`chmod 700 data/` e `chmod 600` em backups) no script de deploy.
+## Planejamento / Backlog (`PROPOSTO` — Detalhado em `/15_FUTURAS_FUNCIONALIDADES.md` · 100% Free Tier)
+- **`FUT-JOG-01` a `FUT-JOG-03`:** Regras da Casa opcionais por sala (Empilhamento de `+2`/`+4`, Comprar até encontrar carta jogável *Draw to Match* e Regra do `7` e `0`).
+- **`FUT-TOR-01`, `FUT-TOR-02` e `FUT-SAL-01`:** Pódio visual de campeões + Card PNG local no encerramento do torneio, coluna explícita `teamName` no CSV para duplas e placar de série na sala casual ("Revanche Rápida").
+- **`FUT-PWA-01` e `FUT-SND-01`:** Modo aplicativo instalável (PWA com *Network-First*) e efeitos sonoros sintetizados via Web Audio API.
+- **`FUT-RES-01`, `FUT-SEG-01`, `FUT-SEG-02`, `FUT-OPS-01` e `FUT-RTC-01`:** Timeout de 45s para jogador desconectado em sala com `turnTimeLimit = 0`, senha temporária com troca obrigatória no 1º login, rate limiting por segundo no WebSocket, alinhamento de `/scripts/deploy.sh` (`DIV-04`) e suporte opcional a TURN self-hosted gratuito (`Coturn`).
 
 ## Próximo passo sugerido
-Publicar o conjunto documental auditado (`AGENTS.md`, `00`–`13`, `README.md`) no branch `main` do repositório oficial `https://github.com/edinhogrubert/Uno-KaWiHe` e validar a Etapa 6 do `./deploy.sh` na VM.
+Publicar o conjunto documental auditado (`AGENTS.md`, `00`–`15`, `README.md` — 24 documentos na raiz) no branch `main` do repositório oficial `https://github.com/edinhogrubert/Uno-KaWiHe` e validar a Etapa 6 do `./deploy.sh` na VM.
 
